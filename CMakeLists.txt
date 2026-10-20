@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(VideoEditor
-    VERSION 0.1.0
+    VERSION 0.0.1
     DESCRIPTION "Native non-linear video editor (Qt 6 + FFmpeg) - case study"
     LANGUAGES C CXX)
 
@@ -21,6 +21,8 @@ option(VE_BUILD_APP "Build the Qt Widgets application" ON)
 option(VE_BUILD_CLI "Build ve-cli (probe / export / playback self-tests without UI)" ON)
 option(VE_BUILD_TESTS "Build the tests" ON)
 option(VE_DEPLOY_ON_BUILD "Copy the Qt/FFmpeg runtime next to the executables after each build (Windows)" ON)
+# Where Help > Check for Updates looks for the latest GitHub release (owner/name).
+set(VE_UPDATE_REPOSITORY "WilkPrintes/videoeditor" CACHE STRING "GitHub repository whose releases the app updates from")
 
 if(MSVC)
     add_compile_options(
@@ -37,7 +39,7 @@ find_package(Threads REQUIRED)
 find_package(FFmpeg REQUIRED COMPONENTS avcodec avformat avutil swscale swresample)
 find_package(Qt6 6.7 REQUIRED COMPONENTS Core)
 if(VE_BUILD_APP)
-    find_package(Qt6 6.7 REQUIRED COMPONENTS Gui Widgets ShaderTools)
+    find_package(Qt6 6.7 REQUIRED COMPONENTS Gui Widgets Network ShaderTools)
     # QRhi (<rhi/qrhi.h>) has limited compatibility guarantees and comes with the GuiPrivate target,
     # which ties the build to this exact Qt version. That is expected here.
     set(QT_NO_PRIVATE_MODULE_WARNING ON)
@@ -125,9 +127,13 @@ if(VE_BUILD_APP)
         ui/LabelColors.cpp ui/LabelColors.h
         ui/SourceViewerPanel.cpp ui/SourceViewerPanel.h
         ui/InspectorWidget.cpp ui/InspectorWidget.h
-        ui/EditIndexWidget.cpp ui/EditIndexWidget.h)
+        ui/EditIndexWidget.cpp ui/EditIndexWidget.h
+        ui/Updater.cpp ui/Updater.h)
     set_target_properties(ve_ui PROPERTIES AUTOMOC ON)
-    target_link_libraries(ve_ui PUBLIC ve_engine Qt6::Widgets Qt6::GuiPrivate)
+    target_link_libraries(ve_ui PUBLIC ve_engine Qt6::Widgets Qt6::GuiPrivate PRIVATE Qt6::Network)
+    target_compile_definitions(ve_ui PUBLIC
+        VE_VERSION="${PROJECT_VERSION}"
+        VE_UPDATE_REPOSITORY="${VE_UPDATE_REPOSITORY}")
 
     # GLSL 440 -> .qsb (SPIR-V + HLSL + MSL + GLSL), loaded at runtime by QRhi as :/shaders/<name>.qsb
     qt_add_shaders(ve_ui "viewer_shaders"
@@ -147,6 +153,9 @@ if(VE_BUILD_APP)
         MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
     target_link_libraries(videoeditor PRIVATE ve_ui)
+    if(APPLE)
+        set_target_properties(videoeditor PROPERTIES OUTPUT_NAME VideoEditor) # VideoEditor.app
+    endif()
 
     if(WIN32 AND VE_DEPLOY_ON_BUILD)
         add_custom_command(TARGET videoeditor POST_BUILD

@@ -6,6 +6,7 @@
 #include "ui/TimelineWidget.h"
 
 #include <QMainWindow>
+#include <QPointer>
 #include <QTimer>
 
 #include <map>
@@ -25,10 +26,13 @@ class QDockWidget;
 class QFrame;
 class QLabel;
 class QMenu;
+class QProgressDialog;
 class QTabBar;
 class QToolButton;
 class SourceViewerPanel;
+class Updater;
 class ViewerWidget;
+struct ReleaseInfo;
 
 // Owns the project, the command stack and the playback engines, and turns UI gestures into
 // commands (timeline drags become transactions). Every model change funnels through
@@ -64,6 +68,11 @@ public:
     QStringList layoutPresets() const;
     void resetLayout();
     void restoreLastLayout();
+
+    // Help > Check for Updates: asks the release feed (GitHub, or VE_UPDATE_FEED) for a newer version
+    // and, in the macOS app, downloads, verifies and installs it, then reopens.
+    void checkForUpdates();
+    Updater* updater();
 
     // The context menu for a right click on the timeline. The window execs it; it is built
     // separately so tests can trigger its actions.
@@ -107,6 +116,9 @@ private:
     void importMedia();
     void exportTimeline();
     void onExportFinished(const ve::ExportResult& result, const QString& path);
+    void onUpdateChecked(bool newer, const ReleaseInfo& release, const QString& error);
+    void onUpdateDownloaded(const ReleaseInfo& release, const QString& zipPath);
+    void closeUpdateProgress();
 
     // Transport of the active viewer (source or timeline).
     void transportToggle();
@@ -199,6 +211,10 @@ private:
     QAction* m_linkedSelectionAction = nullptr;
     QList<QAction*> m_selectionActions; // need clips selected
     QMenu* m_presetsMenu = nullptr;
+    QAction* m_updateAction = nullptr;
+    Updater* m_updater = nullptr;
+    QPointer<QProgressDialog> m_updateProgress;
+    bool m_updating = false; // quitting so the update can replace the app
 
     std::optional<ve::Time> m_markIn;
     std::optional<ve::Time> m_markOut;

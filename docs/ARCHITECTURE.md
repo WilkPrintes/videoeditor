@@ -245,6 +245,24 @@ Os marcadores são da timeline, ordenados e um por frame. Ripples não os movem.
 - O `QWidget` apaga os filhos depois dos membros; por isso o destrutor da `MainWindow` desconecta
   os sinais dos painéis antes.
 
+## Distribuição e atualização (0.0.1)
+
+- A versão vem do `project(VERSION)` do CMake (`VE_VERSION`), que também vai para o `Info.plist`.
+- `ui/Updater` consulta `https://api.github.com/repos/<VE_UPDATE_REPOSITORY>/releases/latest` (ou
+  `VE_UPDATE_FEED`), compara versões com `QVersionNumber` e escolhe o arquivo
+  `VideoEditor-<versão>-<so>-<arquitetura>.zip` desta plataforma e o `.sha256` dele. O download vai
+  para a pasta de cache e só segue se o SHA-256 e o tamanho baterem.
+- No macOS, `prepareInstall` descompacta com `ditto`, confere a versão do `Info.plist` e grava um
+  script. A janela pergunta se há alterações a salvar, inicia o script destacado e fecha. O script
+  espera o processo terminar, troca o bundle (o antigo só é apagado depois que o novo está no lugar)
+  e reabre o app. Um app rodando isolado pelo macOS (App Translocation) ou numa pasta sem permissão
+  de escrita não se atualiza; o usuário recebe o motivo e o link da release.
+- A parte que não depende de rede (versões, leitura do JSON, checksum, download e verificação) é
+  testada em `ve_ui_tests` com um feed de arquivos locais.
+- A release sai do workflow `macos.yml` (veja o README): Qt do download.qt.io, FFmpeg LGPL compilado
+  no CI, `macdeployqt` pelo `cmake --install`, assinatura ad-hoc e a checagem de que todas as
+  bibliotecas vêm do bundle ou do sistema.
+
 ## Persistência
 
 `core/ProjectFile` gera JSON no estilo OTIO (objetos com `schema`, trilhas com `children`, marcadores

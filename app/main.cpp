@@ -95,7 +95,7 @@ int main(int argc, char** argv)
 {
     QApplication::setApplicationName(QStringLiteral("VideoEditor"));
     QApplication::setOrganizationName(QStringLiteral("VideoEditor"));
-    QApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QApplication::setApplicationVersion(QStringLiteral(VE_VERSION));
     QApplication app(argc, argv);
     installLogging();
     applyDarkTheme(app);

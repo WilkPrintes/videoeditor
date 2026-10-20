@@ -67,7 +67,9 @@ Tudo verificado no Windows 11 (RTX 3060). O macOS ainda não foi compilado.
     as trilhas travadas ficaram intactas. Na rodada só com edições ligadas, o alinhamento é estrito;
     na rodada com J/L, mídia só de vídeo ou só de áudio e travas, confere a sincronia. No fim, o undo
     total volta ao projeto inicial.
-- `ve_ui_tests` (Qt Test), que dirige a janela real com mouse e teclado:
+- `ve_ui_tests` (Qt Test), que dirige a janela real com mouse e teclado (e testa o updater com um
+  feed local: versões, escolha do arquivo da plataforma, download conferido por SHA-256 e checksum
+  adulterado recusado):
   - fase 1: importar → cortar → arrastar ao vivo → trim → arraste cancelado com Esc → desfazer →
     tocar;
   - fase 2: adicionar trilhas → ripple com a ferramenta Trim → ripple cancelado → roll (Ctrl) →
@@ -125,6 +127,7 @@ third_party/  miniaudio 0.11.25 (domínio público / MIT-0)
 | FFmpeg (libav*) | 9.0, build "lgpl-shared" da BtbN | LGPL (essa build é LGPLv3) | sem x264; o H.264 sai pelos encoders de hardware ou pelo OpenH264 |
 | miniaudio | 0.11.25 | domínio público ou MIT-0 | vendorizado em `third_party/` |
 | Catch2 | 3.16.1 (amalgamado) | BSL-1.0 | só nos testes; vendorizado em `third_party/catch2` |
+| FFmpeg no macOS | 9.0.2, compilado no CI por `scripts/build-macos-ffmpeg.sh` | LGPL 2.1 ou posterior | sem GPL, sem non-free, só bibliotecas do sistema |
 
 ## Build no Windows
 
@@ -163,53 +166,71 @@ Se o Qt estiver em outro lugar, crie um `CMakeUserPresets.json` (ignorado pelo g
 
 O preset `windows-debug` também funciona, porque o pacote MSVC do Qt traz as DLLs de debug.
 
-## Build no macOS
+## macOS
 
-> Não testado: não havia Mac disponível. O código já tem os caminhos de macOS (Metal no viewer,
-> VideoToolbox para decodificar e codificar, Core Audio pelo miniaudio), mas a primeira
-> compilação pode exigir pequenos ajustes.
+A versão de macOS (Apple Silicon) sai do CI e é publicada como release no GitHub. A 0.0.1 é a
+primeira.
 
-### Apple Silicon com Homebrew (caminho mais simples)
+### Instalar e atualizar
+
+1. Baixe `VideoEditor-<versão>-macos-arm64.zip` da
+   [release mais recente](https://github.com/WilkPrintes/videoeditor/releases/latest), descompacte e
+   arraste `VideoEditor.app` para Aplicativos.
+2. O app não tem assinatura de Developer ID nem notarização, então o macOS bloqueia a primeira
+   abertura. Abra uma vez, vá em Ajustes do Sistema > Privacidade e Segurança e clique em "Abrir
+   Mesmo Assim" (ou rode `xattr -dr com.apple.quarantine /Applications/VideoEditor.app`).
+3. **Atualizar:** Help > Check for Updates, ou o botão *Updates* na barra de status. O app consulta
+   a release mais recente do repositório, baixa o zip do Mac, confere o SHA-256 publicado junto,
+   troca o `VideoEditor.app` depois de fechar (pergunta antes se há alterações a salvar) e abre a
+   versão nova. Para isso o app precisa estar numa pasta que o usuário pode alterar (Aplicativos
+   serve para administradores) e não pode estar rodando direto da pasta de download (o macOS o
+   isola num lugar temporário só de leitura). No Windows, o botão só avisa e abre a página da
+   release.
+
+### Como a release é feita
+
+O workflow [`.github/workflows/macos.yml`](.github/workflows/macos.yml) roda no `macos-15`
+(Apple Silicon):
+
+1. Baixa o Qt 6.12.0 (build universal) do download.qt.io com `scripts/fetch_qt.py`, conferindo o
+   SHA-1 de cada pacote.
+2. Compila o FFmpeg 9.0.2 com `scripts/build-macos-ffmpeg.sh`: bibliotecas dinâmicas, só LGPL,
+   VideoToolbox e AudioToolbox, nada da Homebrew (a autodetecção fica desligada) e SHA-256 da
+   fonte fixado. O resultado fica em cache.
+3. Compila e roda os testes do core. Os testes de GUI e o `ve-cli selftest` também rodam, mas sem
+   barrar o build, porque a máquina virtual pode não ter GPU ou encoder.
+4. `scripts/package-macos.sh`: `cmake --install` (o macdeployqt põe Qt e FFmpeg no bundle),
+   assinatura ad-hoc e uma checagem de que nenhuma biblioteca é carregada de fora do bundle ou do
+   sistema. O resultado é `VideoEditor-<versão>-macos-arm64.zip` mais o `.sha256`, nomes que o
+   updater procura.
+5. Numa tag `v<versão>`, publica a release com esses dois arquivos e o texto de
+   `docs/releases/<versão>.md`. A tag precisa ser igual ao `project(VERSION)` do `CMakeLists.txt`.
+
+Para publicar uma versão nova: suba o `VERSION` no `CMakeLists.txt`, escreva
+`docs/releases/<versão>.md`, faça o commit e mande a tag (`git tag v0.0.2 && git push origin
+v0.0.2`).
+
+### Compilar num Mac
+
+A mesma build da release:
 
 ```bash
 xcode-select --install
-brew install cmake ninja pkgconf qt ffmpeg
-cmake --preset macos-release
-cmake --build --preset macos-release
-ctest --preset macos-release
-open build/macos-release/videoeditor.app
+brew install cmake ninja
+python3 scripts/fetch_qt.py --host mac_x64 --arch clang_64 --extract-with tar --out ~/Qt
+export MACOSX_DEPLOYMENT_TARGET=$(sed -n 's/^QMAKE_MACOSX_DEPLOYMENT_TARGET *= *//p' ~/Qt/6.12.0/clang_64/mkspecs/common/macx.conf)
+bash scripts/build-macos-ffmpeg.sh ~/ffmpeg-lgpl
+cmake -S . -B build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=~/Qt/6.12.0/clang_64 -DFFMPEG_ROOT=~/ffmpeg-lgpl
+cmake --build build/macos
+./build/macos/ve_core_tests
+bash scripts/package-macos.sh build/macos dist
 ```
 
-O preset `macos-release` procura o Qt em `/opt/homebrew`. O FFmpeg é encontrado pelo
-`pkg-config`. Para conferir o motor sem UI:
-
-```bash
-./build/macos-release/ve-cli make-test-clip /tmp/pattern.mp4 10 1920 1080 30
-./build/macos-release/ve-cli selftest /tmp/pattern.mp4 /tmp/out.mp4
-./build/macos-release/ve-cli play /tmp/pattern.mp4 5
-```
-
-### Mac Intel ou Qt do instalador oficial
-
-A Homebrew não tem bottles do Qt para Intel. Nesse caso:
-1. Instale o Qt 6.12 pelo instalador oficial: componente "macOS" mais "Qt Shader Tools".
-2. Rode `brew install cmake ninja pkgconf ffmpeg`.
-3. Configure apontando para o Qt:
-   ```bash
-   cmake --preset macos-release -DCMAKE_PREFIX_PATH=$HOME/Qt/6.12.0/macos
-   ```
-
-### Distribuir o .app
-
-- `macdeployqt build/macos-release/videoeditor.app` copia os frameworks do Qt e as dylibs do
-  FFmpeg para dentro do bundle. Para outros Macs abrirem o app, ainda falta assinar
-  (`codesign`) e notarizar.
-- **Licença:** o FFmpeg da Homebrew é **GPL** (vem com x264). Para distribuir sob LGPL, compile
-  um FFmpeg próprio e passe `FFMPEG_ROOT=<prefixo>` ao CMake:
-  ```bash
-  ./configure --enable-shared --disable-static --disable-gpl --disable-nonfree --enable-videotoolbox --enable-audiotoolbox
-  ```
-  No Mac, o H.264 sai pelo `h264_videotoolbox`.
+Um caminho mais curto, com o Qt e o FFmpeg da Homebrew, também funciona para desenvolver
+(`brew install cmake ninja pkgconf qt ffmpeg`, depois `cmake --preset macos-release` e
+`cmake --build --preset macos-release`). Mas o FFmpeg da Homebrew é **GPL** (vem com x264), então
+esse app não deve ser distribuído. Para testar o updater sem publicar nada, aponte
+`VE_UPDATE_FEED` para um JSON no formato da API do GitHub (veja `tests/ui/ui_tests.cpp`).
 
 ## Uso
 
@@ -252,6 +273,7 @@ A Homebrew não tem bottles do Qt para Intel. Nesse caso:
 | Desfazer / refazer | Ctrl+Z / Ctrl+Shift+Z ou Ctrl+Y |
 | Zoom da timeline | Ctrl+roda, Ctrl+= / Ctrl+-; Shift+Z ajusta tudo |
 | Exportar H.264/MP4 | Ctrl+E |
+| Atualizar o app | Help > Check for Updates, ou o botão *Updates* na barra de status |
 | Salvar / abrir projeto | Ctrl+S / Ctrl+O (`.veproj`, JSON) |
 
 Uma faixa vermelha no topo de um clipe indica que imagem e som do mesmo take saíram de sincronia.
@@ -283,6 +305,8 @@ Variáveis de ambiente:
 - `VE_FFMPEG_LOG=1`: logs detalhados do FFmpeg.
 - `VE_TEST_MEDIA` e `VE_UI_SCREENSHOT`: entrada e screenshot dos testes de GUI (os das fases 2 e 3
   gravam `<nome>_phase2.png` e `<nome>_phase3.png`).
+- `VE_UPDATE_FEED=<url ou arquivo>`: troca o feed de releases do updater (testes; o padrão é a API
+  do GitHub do `WilkPrintes/videoeditor`, definido por `VE_UPDATE_REPOSITORY` no CMake).
 - O app também aceita `videoeditor arquivo.mp4 --seek 120 --play` e `--screenshot shot.png`.
 
 O log fica em `%LOCALAPPDATA%\VideoEditor\VideoEditor\videoeditor.log` no Windows e em
@@ -310,6 +334,9 @@ O log fica em `%LOCALAPPDATA%\VideoEditor\VideoEditor\videoeditor.log` no Window
     mídia no trecho que sairia, como no Avid. Para ignorar uma trilha (música, por exemplo),
     desligue o sync lock dela.
 
+- macOS: só há build para Apple Silicon, e o app não é assinado com Developer ID nem notarizado
+  (veja [Instalar e atualizar](#instalar-e-atualizar)). A instalação automática de atualizações
+  existe só no Mac.
 - Fase 3:
   - Os atalhos ainda são fixos, e não há trim por teclado nem editor de trim (passo 3.6).
   - Com um painel flutuando em foco, os atalhos da janela principal não respondem: clique na

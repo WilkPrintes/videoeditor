@@ -11,6 +11,8 @@
 // - inspectorIndexAndContextMenus (phase 3): rename, colour and disable from the inspector -> colour,
 //   flag and unlink from the clip's context menu -> ripple delete of a gap -> track and marker menus
 //   -> edit index row -> linked selection off -> compound clip opened with a double-click.
+// - updatesFromAFeed (0.0.1): versions, checksums and a GitHub-shaped release feed on local files ->
+//   check (newer / up to date / missing feed) -> download verified by SHA-256 -> tampered checksum.
 //
 // Uses VE_TEST_MEDIA if set, otherwise generates a clapper clip with the engine's test pattern.
 // VE_UI_SCREENSHOT=<file.png> saves the window after the edits (the phase 2 test adds "_phase2").
@@ -21,11 +23,16 @@
 #include "ui/MediaPoolWidget.h"
 #include "ui/SourceViewerPanel.h"
 #include "ui/TimelineWidget.h"
+#include "ui/Updater.h"
 
 #include <QAction>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QDockWidget>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLineEdit>
 #include <QMenu>
 #include <QStandardPaths>
@@ -45,6 +52,7 @@ private slots:
     void multitrackTrimsAndMarkers();
     void panelsLayoutsAndSourceViewer();
     void inspectorIndexAndContextMenus();
+    void updatesFromAFeed();
 
 private:
     QTemporaryDir m_dir;
@@ -665,6 +673,106 @@ void UiTests::inspectorIndexAndContextMenus()
     QCOMPARE(w.project().currentTimeline, parent);
     QVERIFY(ve::edit::checkInvariants(tl(), w.project().media).empty());
     QVERIFY(ve::edit::checkSync(tl()).empty());
+}
+
+void UiTests::updatesFromAFeed()
+{
+    // Versions and checksums.
+    QCOMPARE(update::versionOf(QStringLiteral("v0.0.2")), QVersionNumber(0, 0, 2));
+    QCOMPARE(update::versionOf(QStringLiteral("1.2.3-beta")), QVersionNumber(1, 2, 3));
+    QVERIFY(update::versionOf(QStringLiteral("latest")).isNull());
+    QVERIFY(update::versionOf(QStringLiteral("v0.0.10")) > update::versionOf(QStringLiteral("v0.0.9")));
+    const QByteArray hash(64, 'a');
+    QCOMPARE(update::checksumFrom(hash.toUpper() + "  VideoEditor-0.0.2-macos-arm64.zip\n"), hash);
+    QVERIFY(update::checksumFrom("not a checksum").isEmpty());
+    QCOMPARE(QString::fromLatin1(VE_VERSION), QStringLiteral("0.0.1"));
+
+    // A local release feed shaped like GitHub's, with this platform's archive and its checksum.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString suffix = update::platformAssetSuffix();
+    const QString assetName = QStringLiteral("VideoEditor-0.0.2-%1").arg(suffix);
+    const QByteArray archive = QByteArray("pretend this is a zip ").repeated(5000);
+    auto writeFile = [&](const QString& name, const QByteArray& data) {
+        QFile f(dir.filePath(name));
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(data);
+    };
+    writeFile(assetName, archive);
+    const QByteArray digest = QCryptographicHash::hash(archive, QCryptographicHash::Sha256).toHex();
+    writeFile(assetName + QStringLiteral(".sha256"), digest + "  " + assetName.toUtf8() + "\n");
+    auto feedJson = [&](const QString& tag, qint64 size) {
+        QJsonObject asset{{QStringLiteral("name"), assetName},
+                          {QStringLiteral("size"), size},
+                          {QStringLiteral("browser_download_url"), QUrl::fromLocalFile(dir.filePath(assetName)).toString()}};
+        QJsonObject checksum{{QStringLiteral("name"), assetName + QStringLiteral(".sha256")},
+                             {QStringLiteral("browser_download_url"),
+                              QUrl::fromLocalFile(dir.filePath(assetName + QStringLiteral(".sha256"))).toString()}};
+        QJsonObject other{{QStringLiteral("name"), QStringLiteral("VideoEditor-0.0.2-plan9-mips.zip")},
+                          {QStringLiteral("browser_download_url"), QStringLiteral("https://example.invalid/x.zip")}};
+        QJsonObject release{{QStringLiteral("tag_name"), tag},
+                            {QStringLiteral("name"), QStringLiteral("VideoEditor ") + tag},
+                            {QStringLiteral("body"), QStringLiteral("What changed")},
+                            {QStringLiteral("html_url"), QStringLiteral("https://github.com/WilkPrintes/videoeditor/releases/tag/") + tag},
+                            {QStringLiteral("assets"), QJsonArray{other, asset, checksum}}};
+        return QJsonDocument(release).toJson();
+    };
+
+    QString error;
+    auto parsed = update::parseRelease(feedJson(QStringLiteral("v0.0.2"), archive.size()), suffix, &error);
+    QVERIFY2(parsed, qPrintable(error));
+    QCOMPARE(parsed->version, QVersionNumber(0, 0, 2));
+    QCOMPARE(parsed->assetName, assetName);
+    QVERIFY(parsed->checksumUrl.isLocalFile());
+    QVERIFY(update::parseRelease(feedJson(QStringLiteral("v0.0.2"), 0), QStringLiteral("plan9-arm.zip"))->assetName.isEmpty());
+    QVERIFY(!update::parseRelease("<html>", suffix, &error));
+    QVERIFY(!error.isEmpty());
+
+    // Checking: newer than 0.0.1, not newer than itself.
+    writeFile(QStringLiteral("latest.json"), feedJson(QStringLiteral("v0.0.2"), archive.size()));
+    const QUrl feed = QUrl::fromLocalFile(dir.filePath(QStringLiteral("latest.json")));
+    Updater updater(feed, QVersionNumber(0, 0, 1));
+    QSignalSpy checked(&updater, &Updater::checked);
+    updater.check();
+    QTRY_COMPARE(checked.size(), 1);
+    QCOMPARE(checked[0][0].toBool(), true);
+    QVERIFY(checked[0][2].toString().isEmpty());
+    const ReleaseInfo release = checked[0][1].value<ReleaseInfo>();
+    QCOMPARE(release.version, QVersionNumber(0, 0, 2));
+    Updater current(feed, QVersionNumber(0, 0, 2));
+    QSignalSpy upToDate(&current, &Updater::checked);
+    current.check();
+    QTRY_COMPARE(upToDate.size(), 1);
+    QCOMPARE(upToDate[0][0].toBool(), false);
+    Updater missing(QUrl::fromLocalFile(dir.filePath(QStringLiteral("none.json"))), QVersionNumber(0, 0, 1));
+    QSignalSpy noFeed(&missing, &Updater::checked);
+    missing.check();
+    QTRY_COMPARE(noFeed.size(), 1);
+    QVERIFY(!noFeed[0][2].toString().isEmpty());
+
+    // Downloading: the archive arrives and matches its SHA-256.
+    QSignalSpy downloaded(&updater, &Updater::downloaded);
+    QSignalSpy failed(&updater, &Updater::failed);
+    updater.download(release);
+    QTRY_VERIFY(downloaded.size() + failed.size() == 1);
+    QVERIFY2(failed.isEmpty(), failed.isEmpty() ? "" : qPrintable(failed[0][0].toString()));
+    const QString zip = downloaded[0][1].toString();
+    QFile got(zip);
+    QVERIFY(got.open(QIODevice::ReadOnly));
+    QCOMPARE(got.readAll(), archive);
+    got.close();
+
+    // A checksum that does not match: the download is refused and deleted.
+    writeFile(assetName + QStringLiteral(".sha256"), QByteArray(64, 'b') + "  " + assetName.toUtf8() + "\n");
+    updater.download(release);
+    QTRY_VERIFY(downloaded.size() + failed.size() == 2);
+    QCOMPARE(failed.size(), 1);
+    QVERIFY(failed[0][0].toString().contains(QStringLiteral("SHA-256")));
+    QVERIFY(!QFile::exists(zip));
+
+#if !defined(Q_OS_MACOS)
+    QVERIFY(!Updater::canInstallInPlace()); // only the macOS app replaces itself
+#endif
 }
 
 QTEST_MAIN(UiTests)

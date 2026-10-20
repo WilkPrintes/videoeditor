@@ -12,12 +12,14 @@
 #include "ui/MediaPoolWidget.h"
 #include "ui/SourceViewerPanel.h"
 #include "ui/TimelineWidget.h"
+#include "ui/Updater.h"
 #include "ui/ViewerWidget.h"
 
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
 #include <QCloseEvent>
+#include <QDesktopServices>
 #include <QDir>
 #include <QDockWidget>
 #include <QFileDialog>
@@ -30,7 +32,9 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QProcess>
 #include <QProgressDialog>
+#include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStandardPaths>
@@ -252,6 +256,13 @@ void MainWindow::buildUi()
 
     m_status = new QLabel;
     statusBar()->addPermanentWidget(m_status);
+    // The update button (its action is made in buildActions).
+    auto* updateButton = new QToolButton;
+    updateButton->setObjectName(QStringLiteral("updateButton"));
+    updateButton->setAutoRaise(true);
+    updateButton->setFocusPolicy(Qt::NoFocus);
+    updateButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    statusBar()->addPermanentWidget(updateButton);
 
     // A click in a viewer (or in the timeline) makes it the active viewer.
     m_viewer->installEventFilter(this);
@@ -736,6 +747,14 @@ void MainWindow::buildActions()
     QAction* resetLayoutAction = add(workspace, tr("&Reset Layout"), {}, [this] { resetLayout(); });
 
     QMenu* help = menuBar()->addMenu(tr("&Help"));
+    m_updateAction = add(help, tr("Check for &Updates..."), {}, [this] { checkForUpdates(); });
+    m_updateAction->setObjectName(QStringLiteral("actionCheckForUpdates"));
+    m_updateAction->setIconText(tr("Updates"));
+    m_updateAction->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+    m_updateAction->setToolTip(tr("Look for a newer VideoEditor release (version %1 here)").arg(QStringLiteral(VE_VERSION)));
+    if (auto* button = findChild<QToolButton*>(QStringLiteral("updateButton")))
+        button->setDefaultAction(m_updateAction);
+    help->addSeparator();
     add(help, tr("&About"), {}, [this] {
         QMessageBox::about(this, tr("About VideoEditor"),
                            tr("<b>VideoEditor %1</b> (case study)<br>Qt %2 (RHI: %3), FFmpeg (LGPL, dynamically "
@@ -2077,6 +2096,138 @@ void MainWindow::onExportFinished(const ve::ExportResult& result, const QString&
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Updates (the latest GitHub release; the macOS app installs it by itself)
+// ---------------------------------------------------------------------------------------------
+
+Updater* MainWindow::updater()
+{
+    if (m_updater)
+        return m_updater;
+    QUrl feed = update::githubFeed(QStringLiteral(VE_UPDATE_REPOSITORY));
+    if (const QString custom = qEnvironmentVariable("VE_UPDATE_FEED"); !custom.isEmpty())
+        feed = QUrl::fromUserInput(custom); // a test feed: a local file or another server
+    m_updater = new Updater(feed, update::versionOf(QStringLiteral(VE_VERSION)), this);
+    connect(m_updater, &Updater::checked, this, &MainWindow::onUpdateChecked);
+    connect(m_updater, &Updater::downloadProgress, this, [this](qint64 received, qint64 total) {
+        if (!m_updateProgress)
+            return;
+        m_updateProgress->setMaximum(total > 0 ? int(total / 1024) : 0);
+        m_updateProgress->setValue(int(received / 1024));
+    });
+    connect(m_updater, &Updater::downloaded, this, &MainWindow::onUpdateDownloaded);
+    connect(m_updater, &Updater::failed, this, [this](const QString& error) {
+        closeUpdateProgress();
+        m_updateAction->setEnabled(true);
+        QMessageBox::warning(this, tr("Update"), error);
+    });
+    return m_updater;
+}
+
+void MainWindow::checkForUpdates()
+{
+    m_updateAction->setEnabled(false);
+    statusBar()->showMessage(tr("Checking for updates..."));
+    updater()->check();
+}
+
+void MainWindow::onUpdateChecked(bool newer, const ReleaseInfo& release, const QString& error)
+{
+    m_updateAction->setEnabled(true);
+    statusBar()->clearMessage();
+    if (!error.isEmpty()) {
+        QMessageBox::warning(this, tr("Check for Updates"), tr("Could not check for updates:\n%1").arg(error));
+        return;
+    }
+    if (!newer) {
+        QMessageBox::information(this, tr("Check for Updates"),
+                                 tr("VideoEditor %1 is the latest version.").arg(QStringLiteral(VE_VERSION)));
+        return;
+    }
+
+    QString why;
+    bool canInstall = Updater::canInstallInPlace(&why);
+    if (canInstall && release.assetName.isEmpty()) {
+        canInstall = false;
+        why = tr("This release has no download for this computer.");
+    }
+    QMessageBox box(this);
+    box.setWindowTitle(tr("Update Available"));
+    box.setIcon(QMessageBox::Information);
+    box.setText(tr("VideoEditor %1 is available. You have %2.").arg(release.version.toString(), QStringLiteral(VE_VERSION)));
+    QString details = release.notes.trimmed();
+    if (details.size() > 1200)
+        details = details.left(1200) + QStringLiteral("...");
+    if (!canInstall)
+        details += (details.isEmpty() ? QString() : QStringLiteral("\n\n")) + why;
+    box.setInformativeText(details);
+    QPushButton* install = canInstall ? box.addButton(tr("Download and Install"), QMessageBox::AcceptRole) : nullptr;
+    QPushButton* page = box.addButton(tr("Open Release Page"), QMessageBox::ActionRole);
+    box.addButton(tr("Later"), QMessageBox::RejectRole);
+    box.setDefaultButton(install ? install : page);
+    box.exec();
+
+    if (install && box.clickedButton() == install) {
+        m_updateAction->setEnabled(false);
+        m_updateProgress = new QProgressDialog(tr("Downloading VideoEditor %1...").arg(release.version.toString()),
+                                               tr("Cancel"), 0, 0, this);
+        m_updateProgress->setWindowTitle(tr("Update"));
+        m_updateProgress->setWindowModality(Qt::WindowModal);
+        m_updateProgress->setMinimumDuration(0);
+        m_updateProgress->setAutoClose(false);
+        m_updateProgress->setAutoReset(false);
+        connect(m_updateProgress, &QProgressDialog::canceled, this, [this] {
+            updater()->cancel();
+            closeUpdateProgress();
+            m_updateAction->setEnabled(true);
+        });
+        updater()->download(release);
+    } else if (box.clickedButton() == page) {
+        QDesktopServices::openUrl(release.page);
+    }
+}
+
+void MainWindow::onUpdateDownloaded(const ReleaseInfo& release, const QString& zipPath)
+{
+    closeUpdateProgress();
+    m_updateAction->setEnabled(true);
+    QString error;
+    const auto installer = updater()->prepareInstall(release, zipPath, &error);
+    if (!installer) {
+        QMessageBox::warning(this, tr("Update"),
+                             tr("VideoEditor %1 was downloaded and verified but cannot be installed:\n%2\n\nThe download "
+                                "is in %3")
+                                 .arg(release.version.toString(), error, QDir::toNativeSeparators(zipPath)));
+        return;
+    }
+    if (QMessageBox::question(this, tr("Install Update"),
+                              tr("VideoEditor %1 is ready. VideoEditor will close, replace itself and open again.\n\n"
+                                 "Install now?")
+                                  .arg(release.version.toString()))
+        != QMessageBox::Yes)
+        return;
+    if (m_exporting) {
+        QMessageBox::information(this, tr("Export running"), tr("Wait for the export to finish or cancel it first."));
+        return;
+    }
+    if (!maybeSave())
+        return;
+    if (!QProcess::startDetached(installer->program, installer->arguments)) {
+        QMessageBox::warning(this, tr("Update"), tr("Could not start the installer."));
+        return;
+    }
+    m_updating = true; // the project was saved (or discarded) above
+    close();
+}
+
+void MainWindow::closeUpdateProgress()
+{
+    if (m_updateProgress) {
+        m_updateProgress->close();
+        m_updateProgress->deleteLater();
+    }
+}
+
 void MainWindow::showEvent(QShowEvent* event)
 {
     QMainWindow::showEvent(event);
@@ -2093,7 +2244,7 @@ void MainWindow::closeEvent(QCloseEvent* event)
         event->ignore();
         return;
     }
-    if (!maybeSave()) {
+    if (!m_updating && !maybeSave()) {
         event->ignore();
         return;
     }
