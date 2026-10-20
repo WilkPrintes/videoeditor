@@ -28,7 +28,7 @@ cd "$work/ffmpeg-$version"
 ./configure --prefix="$prefix" \
     --enable-shared --disable-static \
     --disable-gpl --disable-nonfree --disable-autodetect \
-    --enable-videotoolbox --enable-audiotoolbox --enable-zlib --enable-bzlib --enable-iconv \
+    --enable-videotoolbox --enable-audiotoolbox --enable-zlib --enable-bzlib \
     --disable-programs --disable-doc --disable-network --disable-avdevice --disable-avfilter \
     --extra-cflags="-mmacosx-version-min=$target" --extra-ldflags="-mmacosx-version-min=$target"
 make -j"$(sysctl -n hw.ncpu)"
