@@ -11,6 +11,7 @@
 #include "ui/ViewerWidget.h"
 
 #include <QAction>
+#include <QActionGroup>
 #include <QApplication>
 #include <QCloseEvent>
 #include <QFileDialog>
@@ -30,8 +31,10 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <memory>
 
 using ve::Time;
 
@@ -181,28 +184,74 @@ void MainWindow::buildUi()
         else
             m_commands.abort();
     });
-    connect(m_timeline, &TimelineWidget::moveRequested, this, [this](const QStringList& ids, Time delta) {
+    connect(m_timeline, &TimelineWidget::moveRequested, this, [this](const QStringList& ids, Time delta, int shift) {
         std::vector<ve::Id> clips;
         for (const QString& id : ids)
             clips.push_back(utf8(id));
-        edit(tr("Move"), [clips, delta](ve::Timeline& tl, const ve::MediaPool&) {
-            return ve::edit::moveClips(tl, clips, delta);
+        edit(tr("Move"), [clips, delta, shift](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::moveClips(tl, clips, delta, shift);
         }, kGestureMergeKey);
     });
-    connect(m_timeline, &TimelineWidget::trimRequested, this, [this](const QString& id, bool head, Time edge) {
+    connect(m_timeline, &TimelineWidget::trimRequested, this, [this](const QString& id, bool head, Time edge, bool linked) {
         const ve::Id clip = utf8(id);
-        edit(tr("Trim"), [clip, head, edge](ve::Timeline& tl, const ve::MediaPool& pool) {
-            return ve::edit::trimClip(tl, pool, clip, head ? ve::edit::Edge::Head : ve::edit::Edge::Tail, edge);
+        edit(tr("Trim"), [clip, head, edge, linked](ve::Timeline& tl, const ve::MediaPool& pool) {
+            return ve::edit::trimClip(tl, pool, clip, head ? ve::edit::Edge::Head : ve::edit::Edge::Tail, edge, linked);
         }, kGestureMergeKey);
+    });
+    connect(m_timeline, &TimelineWidget::trimEditRequested, this,
+            [this](TimelineWidget::TrimMode mode, const QString& id, bool head, Time delta, bool linked) {
+        const ve::Id clip = utf8(id);
+        const auto edge = head ? ve::edit::Edge::Head : ve::edit::Edge::Tail;
+        switch (mode) {
+        case TimelineWidget::TrimMode::Ripple:
+            edit(tr("Ripple"), [=](ve::Timeline& tl, const ve::MediaPool& pool) {
+                return ve::edit::rippleTrim(tl, pool, clip, edge, delta, linked);
+            }, kGestureMergeKey);
+            break;
+        case TimelineWidget::TrimMode::Roll:
+            edit(tr("Roll"), [=](ve::Timeline& tl, const ve::MediaPool& pool) {
+                return ve::edit::rollTrim(tl, pool, clip, edge, delta, linked);
+            }, kGestureMergeKey);
+            break;
+        case TimelineWidget::TrimMode::Slip:
+            edit(tr("Slip"), [=](ve::Timeline& tl, const ve::MediaPool& pool) {
+                return ve::edit::slipClip(tl, pool, clip, delta);
+            }, kGestureMergeKey);
+            break;
+        case TimelineWidget::TrimMode::Slide:
+            edit(tr("Slide"), [=](ve::Timeline& tl, const ve::MediaPool& pool) {
+                return ve::edit::slideClip(tl, pool, clip, delta);
+            }, kGestureMergeKey);
+            break;
+        }
+    });
+    connect(m_timeline, &TimelineWidget::markerMoveRequested, this, [this](const QString& id, Time to) {
+        const ve::Id marker = utf8(id);
+        edit(tr("Move Marker"), [marker, to](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::moveMarker(tl, marker, to);
+        }, kGestureMergeKey);
+    });
+    connect(m_timeline, &TimelineWidget::trackFlagRequested, this,
+            [this](const QString& id, TimelineWidget::TrackFlag flag, bool on) {
+        const ve::Id track = utf8(id);
+        if (flag == TimelineWidget::TrackFlag::Lock)
+            edit(on ? tr("Lock Track") : tr("Unlock Track"), [track, on](ve::Timeline& tl, const ve::MediaPool&) {
+                return ve::edit::setTrackLocked(tl, track, on);
+            });
+        else
+            edit(on ? tr("Sync Lock Track") : tr("Remove Sync Lock"), [track, on](ve::Timeline& tl, const ve::MediaPool&) {
+                return ve::edit::setTrackSyncLock(tl, track, on);
+            });
     });
     connect(m_timeline, &TimelineWidget::mediaDropped, this,
-            [this](const QString& mediaId, Time at) { placeMediaAt(mediaId, at); });
+            [this](const QString& mediaId, Time at, const QString& trackId) { placeMediaAt(mediaId, at, trackId); });
     connect(m_timeline, &TimelineWidget::filesDropped, this,
             [this](const QStringList& paths, Time at) { importFiles(paths, at); });
     connect(m_timeline, &TimelineWidget::selectionChanged, this, &MainWindow::updateWindowState);
     connect(m_pool, &MediaPoolWidget::mediaActivated, this,
             [this](const QString& id) { placeMediaAt(id, std::nullopt); });
     connect(m_pool, &MediaPoolWidget::filesDropped, this, [this](const QStringList& paths) { importFiles(paths); });
+    connect(m_pool, &QListWidget::itemSelectionChanged, this, &MainWindow::updateWindowState);
 }
 
 void MainWindow::buildActions()
@@ -236,6 +285,62 @@ void MainWindow::buildActions()
                         [this] { splitAtPlayhead(); });
     m_deleteAction = add(editMenu, tr("&Delete Clips"), {QKeySequence::Delete, QKeySequence(Qt::Key_Backspace)},
                          [this] { deleteSelection(); });
+    m_rippleDeleteAction = add(editMenu, tr("R&ipple Delete"),
+                               {QKeySequence(Qt::SHIFT | Qt::Key_Delete), QKeySequence(Qt::SHIFT | Qt::Key_Backspace)},
+                               [this] { rippleDeleteSelection(); });
+    editMenu->addSeparator();
+    // Tools (spec §6.2): what a drag on a clip does. Modifiers are listed in TimelineWidget.h.
+    auto* tools = new QActionGroup(this);
+    QAction* selectTool = add(editMenu, tr("&Selection Tool"), {QKeySequence(Qt::Key_A)},
+                              [this] { m_timeline->setTool(TimelineWidget::Tool::Select); });
+    QAction* trimTool = add(editMenu, tr("&Trim Tool (ripple, slip, slide)"), {QKeySequence(Qt::Key_T)},
+                            [this] { m_timeline->setTool(TimelineWidget::Tool::Trim); });
+    for (QAction* a : {selectTool, trimTool}) {
+        a->setCheckable(true);
+        tools->addAction(a);
+    }
+    selectTool->setChecked(true);
+    QAction* snapping = add(editMenu, tr("S&napping"), {QKeySequence(Qt::Key_N)},
+                            [this](bool on) { m_timeline->setSnapping(on); });
+    snapping->setCheckable(true);
+    snapping->setChecked(true);
+
+    QMenu* timelineMenu = menuBar()->addMenu(tr("&Timeline"));
+    const std::pair<SourceEdit, std::pair<QString, QList<QKeySequence>>> sourceEdits[] = {
+        {SourceEdit::Insert, {tr("&Insert"), {QKeySequence(Qt::Key_F9)}}},
+        {SourceEdit::Overwrite, {tr("&Overwrite"), {QKeySequence(Qt::Key_F10)}}},
+        {SourceEdit::Replace, {tr("&Replace"), {QKeySequence(Qt::Key_F11)}}},
+        {SourceEdit::FitToFill, {tr("&Fit to Fill"), {QKeySequence(Qt::SHIFT | Qt::Key_F11)}}},
+        {SourceEdit::PlaceOnTop, {tr("Place on &Top"), {QKeySequence(Qt::Key_F12)}}},
+    };
+    const char* sourceEditNames[] = {"actionInsert", "actionOverwrite", "actionReplace", "actionFitToFill", "actionPlaceOnTop"};
+    for (std::size_t i = 0; i < std::size(sourceEdits); ++i) {
+        const SourceEdit kind = sourceEdits[i].first;
+        QAction* a = add(timelineMenu, sourceEdits[i].second.first, sourceEdits[i].second.second, [this, kind] { sourceEdit(kind); });
+        a->setObjectName(QLatin1String(sourceEditNames[i]));
+        a->setToolTip(tr("Edits the media selected in the pool onto the destination tracks, at the playhead or the In/Out"));
+        m_sourceEditActions << a;
+    }
+    timelineMenu->addSeparator();
+    QAction* markInAction = add(timelineMenu, tr("Mark &In"), {QKeySequence(Qt::Key_I)}, [this] { markIn(); });
+    QAction* markOutAction = add(timelineMenu, tr("Mark O&ut"), {QKeySequence(Qt::Key_O)}, [this] { markOut(); });
+    add(timelineMenu, tr("&Clear In and Out"), {QKeySequence(Qt::ALT | Qt::Key_X)}, [this] { clearMarks(); });
+    timelineMenu->addSeparator();
+    QAction* addMarkerAction = add(timelineMenu, tr("Add &Marker"), {QKeySequence(Qt::Key_M)}, [this] { addMarker(); });
+    add(timelineMenu, tr("Previous Marker"), {QKeySequence(Qt::SHIFT | Qt::Key_Up)}, [this] { jumpToMarker(-1); });
+    add(timelineMenu, tr("Next Marker"), {QKeySequence(Qt::SHIFT | Qt::Key_Down)}, [this] { jumpToMarker(1); });
+    add(timelineMenu, tr("Previous Edit"), {QKeySequence(Qt::Key_Up)}, [this] { jumpToEdit(-1); });
+    add(timelineMenu, tr("Next Edit"), {QKeySequence(Qt::Key_Down)}, [this] { jumpToEdit(1); });
+    timelineMenu->addSeparator();
+    QAction* addVideoTrack = add(timelineMenu, tr("Add &Video Track"), {QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_V)},
+                                 [this] { addTrack(ve::TrackKind::Video); });
+    QAction* addAudioTrack = add(timelineMenu, tr("Add &Audio Track"), {QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_A)},
+                                 [this] { addTrack(ve::TrackKind::Audio); });
+    timelineMenu->addSeparator();
+    m_composeAction = add(timelineMenu, tr("New &Compound Clip"), {QKeySequence(Qt::ALT | Qt::Key_C)},
+                          [this] { composeSelection(); });
+    m_decomposeAction = add(timelineMenu, tr("&Decompose Compound Clip"), {QKeySequence(Qt::ALT | Qt::SHIFT | Qt::Key_C)},
+                            [this] { decomposeSelection(); });
 
     QMenu* playback = menuBar()->addMenu(tr("&Playback"));
     QAction* playPause = add(playback, tr("Play / Pause"), {QKeySequence(Qt::Key_Space)}, [this] { togglePlay(); });
@@ -274,7 +379,18 @@ void MainWindow::buildActions()
     m_redoAction->setObjectName(QStringLiteral("actionRedo"));
     m_splitAction->setObjectName(QStringLiteral("actionSplit"));
     m_deleteAction->setObjectName(QStringLiteral("actionDelete"));
+    m_rippleDeleteAction->setObjectName(QStringLiteral("actionRippleDelete"));
     playPause->setObjectName(QStringLiteral("actionPlayPause"));
+    selectTool->setObjectName(QStringLiteral("actionSelectTool"));
+    trimTool->setObjectName(QStringLiteral("actionTrimTool"));
+    snapping->setObjectName(QStringLiteral("actionSnapping"));
+    markInAction->setObjectName(QStringLiteral("actionMarkIn"));
+    markOutAction->setObjectName(QStringLiteral("actionMarkOut"));
+    addMarkerAction->setObjectName(QStringLiteral("actionAddMarker"));
+    addVideoTrack->setObjectName(QStringLiteral("actionAddVideoTrack"));
+    addAudioTrack->setObjectName(QStringLiteral("actionAddAudioTrack"));
+    m_composeAction->setObjectName(QStringLiteral("actionCompose"));
+    m_decomposeAction->setObjectName(QStringLiteral("actionDecompose"));
 
     QToolBar* bar = addToolBar(tr("Main"));
     bar->setMovable(false);
@@ -285,8 +401,18 @@ void MainWindow::buildActions()
     bar->addAction(m_undoAction);
     bar->addAction(m_redoAction);
     bar->addSeparator();
+    bar->addAction(selectTool);
+    bar->addAction(trimTool);
+    bar->addAction(snapping);
+    bar->addSeparator();
     bar->addAction(m_splitAction);
     bar->addAction(m_deleteAction);
+    bar->addAction(m_rippleDeleteAction);
+    bar->addSeparator();
+    for (QAction* a : m_sourceEditActions)
+        bar->addAction(a);
+    bar->addSeparator();
+    bar->addAction(addMarkerAction);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -297,7 +423,7 @@ void MainWindow::onModelChanged()
 {
     auto snapshot = ve::TimelineSnapshot::fromProject(m_project);
     const bool changed = !m_snapshot || m_snapshot->timeline != snapshot->timeline
-        || m_snapshot->media.size() != snapshot->media.size();
+        || m_snapshot->nested != snapshot->nested || m_snapshot->media.size() != snapshot->media.size();
     if (changed) {
         m_snapshot = snapshot;
         m_engine->setTimeline(snapshot);
@@ -320,9 +446,23 @@ void MainWindow::updateWindowState()
 
     const ve::Timeline& tl = m_project.timeline();
     const bool hasClips = tl.hasClips();
+    const std::vector<ve::Id> selected = m_timeline->selectedClips();
+    bool compoundSelected = false;
+    for (const ve::Track& t : tl.tracks) {
+        for (const ve::PlacedItem& p : t.clips())
+            compoundSelected |= std::holds_alternative<ve::CompoundClip>(*p.item)
+                && std::find(selected.begin(), selected.end(), p.clip->id) != selected.end();
+    }
     m_splitAction->setEnabled(hasClips);
-    m_deleteAction->setEnabled(!m_timeline->selectedClips().empty());
+    m_deleteAction->setEnabled(!selected.empty() || !m_timeline->selectedMarker().empty());
+    m_rippleDeleteAction->setEnabled(!selected.empty());
+    m_composeAction->setEnabled(!selected.empty());
+    m_decomposeAction->setEnabled(compoundSelected);
+    const bool hasSource = !m_pool->sourceMediaId().isEmpty();
+    for (QAction* a : m_sourceEditActions)
+        a->setEnabled(hasSource);
     m_exportAction->setEnabled(hasClips && !m_exporting);
+    m_timeline->setMarks(m_markIn, m_markOut);
 
     m_duration->setText(qs(ve::formatTimecode(tl.duration(), tl.rate)));
     m_status->setText(tr("Timeline %1x%2 @ %3 fps    GPU: %4")
@@ -424,26 +564,228 @@ void MainWindow::splitAtPlayhead()
 
 void MainWindow::deleteSelection()
 {
+    // A selected marker goes first; clips are deleted when no marker is selected.
+    const ve::Id marker = m_timeline->selectedMarker();
+    if (!marker.empty()) {
+        edit(tr("Delete Marker"), [marker](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::removeMarker(tl, marker); });
+        return;
+    }
     const std::vector<ve::Id> selected = m_timeline->selectedClips();
     if (selected.empty())
         return;
     edit(tr("Delete"), [selected](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::deleteClips(tl, selected); });
 }
 
-void MainWindow::placeMediaAt(const QString& mediaId, std::optional<Time> at)
+void MainWindow::rippleDeleteSelection()
+{
+    const std::vector<ve::Id> selected = m_timeline->selectedClips();
+    if (selected.empty())
+        return;
+    if (!edit(tr("Ripple Delete"), [selected](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::rippleDelete(tl, selected); }))
+        statusBar()->showMessage(tr("Ripple delete refused: a sync-locked track has other clips in that time. "
+                                    "Turn off its sync lock (or lock it) to leave it as it is."),
+                                 6000);
+}
+
+void MainWindow::placeMediaAt(const QString& mediaId, std::optional<Time> at, const QString& trackId)
 {
     const ve::MediaItem* found = m_project.media.find(utf8(mediaId));
     if (!found)
         return;
     const ve::MediaItem media = *found;
     const bool conform = !m_project.timeline().hasClips() && media.hasVideo;
-    edit(tr("Place %1").arg(qs(media.name)), [media, at, conform](ve::Timeline& tl, const ve::MediaPool&) {
-        if (conform)
-            conformTimeline(tl, media);
-        return !ve::edit::placeMedia(tl, media, at).empty();
-    });
+    const ve::Track* row = m_project.timeline().track(utf8(trackId));
+    if (row && at) {
+        // Dropped on a track: overwrite there, the other kind on the track of the same number.
+        ve::edit::EditPoints p;
+        p.mediaId = media.id;
+        p.playhead = *at;
+        const int index = ve::edit::kindIndex(m_project.timeline(), row->id);
+        for (ve::TrackKind kind : {ve::TrackKind::Video, ve::TrackKind::Audio}) {
+            const ve::Track* t = kind == row->kind ? row : ve::edit::trackOfKind(m_project.timeline(), kind, index);
+            if (!t)
+                t = m_project.timeline().track(m_timeline->destinationTrack(kind));
+            (kind == ve::TrackKind::Video ? p.videoTrack : p.audioTrack) = t && !t->locked ? t->id : ve::Id{};
+        }
+        if (!edit(tr("Place %1").arg(qs(media.name)), [media, p, conform](ve::Timeline& tl, const ve::MediaPool& pool) {
+                if (conform)
+                    conformTimeline(tl, media);
+                return !ve::edit::overwriteEdit(tl, pool, p).empty();
+            }))
+            statusBar()->showMessage(tr("That track is locked"), 3000);
+    } else {
+        edit(tr("Place %1").arg(qs(media.name)), [media, at, conform](ve::Timeline& tl, const ve::MediaPool&) {
+            if (conform)
+                conformTimeline(tl, media);
+            return !ve::edit::placeMedia(tl, media, at).empty();
+        });
+    }
     if (conform)
         m_timeline->zoomToFit();
+}
+
+void MainWindow::sourceEdit(SourceEdit kind)
+{
+    const ve::MediaItem* found = m_project.media.find(utf8(m_pool->sourceMediaId()));
+    if (!found) {
+        statusBar()->showMessage(tr("Select the media to edit in the media pool first"), 4000);
+        return;
+    }
+    const ve::MediaItem media = *found;
+    ve::edit::EditPoints p;
+    p.mediaId = media.id;
+    p.playhead = m_engine->position();
+    p.recordIn = m_markIn;
+    p.recordOut = m_markOut;
+    p.videoTrack = m_timeline->destinationTrack(ve::TrackKind::Video);
+    p.audioTrack = m_timeline->destinationTrack(ve::TrackKind::Audio);
+    const bool conform = !m_project.timeline().hasClips() && media.hasVideo;
+
+    QString name;
+    switch (kind) {
+    case SourceEdit::Insert: name = tr("Insert %1"); break;
+    case SourceEdit::Overwrite: name = tr("Overwrite %1"); break;
+    case SourceEdit::Replace: name = tr("Replace with %1"); break;
+    case SourceEdit::FitToFill: name = tr("Fit to Fill %1"); break;
+    case SourceEdit::PlaceOnTop: name = tr("Place %1 on Top"); break;
+    }
+    auto end = std::make_shared<std::optional<Time>>(); // where the new clips end, for the playhead
+    const bool ok = edit(name.arg(qs(media.name)), [media, p, kind, conform, end](ve::Timeline& tl, const ve::MediaPool& pool) {
+        if (conform)
+            conformTimeline(tl, media);
+        std::vector<ve::Id> ids;
+        switch (kind) {
+        case SourceEdit::Insert: ids = ve::edit::insertEdit(tl, pool, p); break;
+        case SourceEdit::Overwrite: ids = ve::edit::overwriteEdit(tl, pool, p); break;
+        case SourceEdit::Replace: ids = ve::edit::replaceEdit(tl, pool, p); break;
+        case SourceEdit::FitToFill: ids = ve::edit::fitToFillEdit(tl, pool, p); break;
+        case SourceEdit::PlaceOnTop: ids = ve::edit::placeOnTopEdit(tl, pool, p); break;
+        }
+        if (!ids.empty()) {
+            if (auto loc = tl.locateClip(ids.front()))
+                *end = loc->end();
+        }
+        return !ids.empty();
+    });
+    if (!ok) {
+        statusBar()->showMessage(kind == SourceEdit::FitToFill
+                                     ? tr("Fit to fill needs a timeline Out point (O) and a free destination track")
+                                 : kind == SourceEdit::Replace
+                                     ? tr("Replace needs a clip under the playhead on a destination track, and enough media")
+                                     : tr("Edit refused: check the In/Out points, the media length and the destination tracks "
+                                          "(locked ones cannot be edited)"),
+                                 6000);
+        return;
+    }
+    clearMarks();
+    if (conform)
+        m_timeline->zoomToFit();
+    if (*end && kind != SourceEdit::Replace)
+        seekTo(**end); // like other editors, the playhead moves past the new clip
+}
+
+bool MainWindow::editProject(const QString& name, ve::ProjectEditCommand::Operation op)
+{
+    return m_commands.editProject(utf8(name), std::move(op));
+}
+
+void MainWindow::composeSelection()
+{
+    const std::vector<ve::Id> selected = m_timeline->selectedClips();
+    if (selected.empty())
+        return;
+    if (!editProject(tr("New Compound Clip"), [selected](ve::Project& p) { return ve::edit::composeClips(p, selected).has_value(); }))
+        statusBar()->showMessage(tr("Cannot make a compound clip: other clips on those tracks overlap the selection"), 6000);
+}
+
+void MainWindow::decomposeSelection()
+{
+    for (const ve::Id& id : m_timeline->selectedClips()) {
+        auto loc = m_project.timeline().locateClip(id);
+        if (loc && std::holds_alternative<ve::CompoundClip>(loc->item)) {
+            if (!editProject(tr("Decompose Compound Clip"), [id](ve::Project& p) { return ve::edit::decomposeClip(p, id); }))
+                statusBar()->showMessage(tr("Cannot decompose: a track it needs is locked"), 5000);
+            return;
+        }
+    }
+}
+
+void MainWindow::addTrack(ve::TrackKind kind)
+{
+    edit(kind == ve::TrackKind::Video ? tr("Add Video Track") : tr("Add Audio Track"),
+         [kind](ve::Timeline& tl, const ve::MediaPool&) { return !ve::edit::addTrack(tl, kind).empty(); });
+}
+
+void MainWindow::markIn()
+{
+    m_markIn = ve::floorToFrame(m_engine->position(), m_project.timeline().rate);
+    if (m_markOut && *m_markOut <= *m_markIn)
+        m_markOut.reset();
+    updateWindowState();
+}
+
+void MainWindow::markOut()
+{
+    // The Out includes the frame under the playhead.
+    const ve::Rate rate = m_project.timeline().rate;
+    m_markOut = ve::timeOfFrame(ve::frameAt(m_engine->position(), rate) + 1, rate);
+    if (m_markIn && *m_markIn >= *m_markOut)
+        m_markIn.reset();
+    updateWindowState();
+}
+
+void MainWindow::clearMarks()
+{
+    m_markIn.reset();
+    m_markOut.reset();
+    updateWindowState();
+}
+
+void MainWindow::addMarker()
+{
+    const Time at = m_engine->position();
+    const QString name = tr("Marker %1").arg(m_project.timeline().markers.size() + 1);
+    if (!edit(tr("Add Marker"), [at, name](ve::Timeline& tl, const ve::MediaPool&) {
+            return !ve::edit::addMarker(tl, at, utf8(name)).empty();
+        }))
+        statusBar()->showMessage(tr("There is already a marker on this frame"), 3000);
+}
+
+void MainWindow::jumpToEdit(int direction)
+{
+    const ve::Timeline& tl = m_project.timeline();
+    const Time now = ve::floorToFrame(m_engine->position(), tl.rate);
+    const std::vector<Time> points = ve::edit::editPoints(tl);
+    if (direction > 0) {
+        auto it = std::upper_bound(points.begin(), points.end(), now);
+        if (it != points.end())
+            seekTo(*it);
+    } else {
+        auto it = std::lower_bound(points.begin(), points.end(), now);
+        if (it != points.begin())
+            seekTo(*std::prev(it));
+    }
+}
+
+void MainWindow::jumpToMarker(int direction)
+{
+    const ve::Timeline& tl = m_project.timeline();
+    const Time now = ve::floorToFrame(m_engine->position(), tl.rate);
+    if (direction > 0) {
+        for (const ve::Marker& m : tl.markers) {
+            if (m.start > now) {
+                seekTo(m.start);
+                return;
+            }
+        }
+    } else {
+        for (auto it = tl.markers.rbegin(); it != tl.markers.rend(); ++it) {
+            if (it->start < now) {
+                seekTo(it->start);
+                return;
+            }
+        }
+    }
 }
 
 void MainWindow::importFiles(const QStringList& paths, std::optional<Time> at)

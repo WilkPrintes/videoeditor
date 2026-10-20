@@ -14,6 +14,10 @@ public:
     explicit MediaPoolWidget(QWidget* parent = nullptr);
 
     void setMedia(const ve::MediaPool& pool, ve::Rate timelineRate);
+    // The source of three and four point edits: the selected media (the first of several), or the only
+    // one in the pool. Empty when there is no obvious choice.
+    QString sourceMediaId() const;
+    void selectMedia(const QString& mediaId);
 
 signals:
     void mediaActivated(const QString& mediaId);

@@ -1,12 +1,18 @@
-// GUI smoke test: drives the real MainWindow with synthetic mouse and key events, the path a user
-// takes (import -> blade -> drag clip -> trim edge -> cancelled drag -> undo -> play), and checks the
-// model after each step.
+// GUI tests: drive the real MainWindow with synthetic mouse and key events, the paths a user takes,
+// and check the model after each step.
+// - editAndPlayThroughTheUi (phase 1): import -> blade -> drag clip -> trim edge -> cancelled drag ->
+//   undo -> play.
+// - multitrackTrimsAndMarkers (phase 2): add tracks -> ripple with the trim tool -> cancelled ripple ->
+//   roll (Ctrl) -> L cut (Ctrl+Alt) -> slip -> move to V2 -> marker snapping -> lock from the track
+//   header -> insert from the media pool (F9), each drag one undo step.
 //
 // Uses VE_TEST_MEDIA if set, otherwise generates a clapper clip with the engine's test pattern.
-// VE_UI_SCREENSHOT=<file.png> saves the window after the edits.
+// VE_UI_SCREENSHOT=<file.png> saves the window after the edits (the phase 2 test adds "_phase2").
 
+#include "core/Edit.h"
 #include "media/TestPattern.h"
 #include "ui/MainWindow.h"
+#include "ui/MediaPoolWidget.h"
 #include "ui/TimelineWidget.h"
 
 #include <QAction>
@@ -21,6 +27,7 @@ class UiTests : public QObject {
 private slots:
     void initTestCase();
     void editAndPlayThroughTheUi();
+    void multitrackTrimsAndMarkers();
 
 private:
     QTemporaryDir m_dir;
@@ -139,6 +146,182 @@ void UiTests::editAndPlayThroughTheUi()
     action("actionPlayPause")->trigger();
     QTRY_VERIFY(!w.isPlaying());
     QVERIFY2(played >= 15 && played <= 40, qPrintable(QStringLiteral("played %1 frames in ~1 s").arg(played)));
+}
+
+void UiTests::multitrackTrimsAndMarkers()
+{
+    MainWindow w;
+    w.resize(1400, 900);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    auto* timeline = w.findChild<TimelineWidget*>();
+    QVERIFY(timeline);
+    const ve::Rate rate{30, 1};
+    auto frame = [&](std::int64_t n) { return ve::timeOfFrame(n, rate); };
+    auto tl = [&]() -> const ve::Timeline& { return w.project().timeline(); };
+    auto track = [&](const char* name) -> const ve::Track& {
+        const ve::Track* found = nullptr;
+        for (const ve::Track& t : tl().tracks) {
+            if (t.name == name)
+                found = &t;
+        }
+        if (!found)
+            qFatal("no track %s", name);
+        return *found;
+    };
+    auto clips = [&](const char* name) { return track(name).clips(); };
+    auto action = [&](const char* name) {
+        auto* a = w.findChild<QAction*>(QLatin1String(name));
+        Q_ASSERT(a);
+        return a;
+    };
+    auto undoText = [&] { return action("actionUndo")->text(); };
+    auto drag = [&](QPoint from, QPoint to, Qt::KeyboardModifiers modifiers = {}) {
+        QTest::mousePress(timeline, Qt::LeftButton, modifiers, from);
+        QTest::mouseMove(timeline, (from + to) / 2);
+        QTest::mouseMove(timeline, to);
+        QTest::mouseRelease(timeline, Qt::LeftButton, modifiers, to);
+    };
+    auto tailOf = [&](const ve::Id& clip) {
+        const QRect r = timeline->clipRect(clip);
+        return QPoint(r.right() - 2, r.center().y());
+    };
+
+    // Multitrack: one more video and one more audio track, undoable.
+    w.importFiles({m_media});
+    QCOMPARE(tl().duration(), frame(240));
+    action("actionAddVideoTrack")->trigger();
+    action("actionAddAudioTrack")->trigger();
+    QCOMPARE(tl().tracks.size(), std::size_t(4));
+    QVERIFY(undoText().contains(QStringLiteral("Add Audio Track")));
+    action("actionUndo")->trigger();
+    QCOMPARE(tl().tracks.size(), std::size_t(3));
+    action("actionRedo")->trigger();
+    QCOMPARE(track("A2").kind, ve::TrackKind::Audio);
+
+    w.seekTo(frame(120));
+    QTRY_COMPARE(w.playheadPosition(), frame(120));
+    action("actionSplit")->trigger();
+    QCOMPARE(clips("V1").size(), std::size_t(2));
+    QTest::qWait(50);
+
+    // Trim tool, edge: ripple. The second clip follows the shorter first one; no gap is left.
+    action("actionTrimTool")->trigger();
+    QCOMPARE(timeline->tool(), TimelineWidget::Tool::Trim);
+    QPoint from = tailOf(clips("V1")[0].clip->id);
+    drag(from, from - QPoint(40, 0));
+    auto v = clips("V1");
+    QCOMPARE(v.size(), std::size_t(2));
+    const Time cut = v[0].end();
+    QVERIFY(cut < frame(120));
+    QCOMPARE(v[1].start, cut);
+    QCOMPARE(clips("A1")[1].start, cut);
+    QCOMPARE(tl().duration(), frame(240) - (frame(120) - cut));
+    QVERIFY(undoText().contains(QStringLiteral("Ripple")));
+    const ve::Timeline afterRipple = tl();
+
+    // Escape in the middle of a ripple rolls it back.
+    from = tailOf(clips("V1")[0].clip->id);
+    QTest::mousePress(timeline, Qt::LeftButton, {}, from);
+    QTest::mouseMove(timeline, from - QPoint(30, 0));
+    QVERIFY(tl() != afterRipple);
+    QTest::keyClick(timeline, Qt::Key_Escape);
+    QTest::mouseRelease(timeline, Qt::LeftButton, {}, from - QPoint(30, 0));
+    QVERIFY(tl() == afterRipple);
+
+    // Ctrl+edge: roll. The cut moves later, the length of the timeline stays.
+    drag(tailOf(clips("V1")[0].clip->id), tailOf(clips("V1")[0].clip->id) + QPoint(25, 0), Qt::ControlModifier);
+    v = clips("V1");
+    QVERIFY(v[0].end() > cut);
+    QCOMPARE(v[1].start, v[0].end());
+    QCOMPARE(tl().duration(), afterRipple.duration());
+    QVERIFY(undoText().contains(QStringLiteral("Roll")));
+    const Time rolledCut = v[0].end();
+
+    // Ctrl+Alt on the sound's edge: roll that track only, an L cut that keeps picture and sound in sync.
+    from = tailOf(clips("A1")[0].clip->id);
+    drag(from, from + QPoint(25, 0), Qt::ControlModifier | Qt::AltModifier);
+    QVERIFY(clips("A1")[0].end() > rolledCut);
+    QCOMPARE(clips("V1")[0].end(), rolledCut);
+    QVERIFY(ve::edit::checkSync(tl()).empty());
+    action("actionUndo")->trigger();
+    QCOMPARE(clips("A1")[0].end(), rolledCut);
+
+    // Trim tool, body: slip. The media follows the mouse (earlier frames); place and length stay.
+    const ve::Id second = clips("V1")[1].clip->id;
+    const Time secondSource = clips("V1")[1].clip->sourceRange.start;
+    from = timeline->clipRect(second).center();
+    drag(from, from + QPoint(30, 0));
+    QVERIFY(clips("V1")[1].clip->sourceRange.start < secondSource);
+    QCOMPARE(clips("V1")[1].start, rolledCut);
+    QCOMPARE(clips("A1")[1].clip->sourceRange.start, clips("V1")[1].clip->sourceRange.start);
+    QVERIFY(undoText().contains(QStringLiteral("Slip")));
+
+    // Selection tool, body dragged one row up: picture to V2, sound to A2.
+    action("actionSelectTool")->trigger();
+    const ve::Id secondSound = clips("A1")[1].clip->id;
+    from = timeline->clipRect(second).center();
+    drag(from, QPoint(from.x(), timeline->trackHeaderRect(track("V2").id).center().y()));
+    QVERIFY(track("V2").findClip(second));
+    QVERIFY(track("A2").findClip(secondSound));
+    QCOMPARE(clips("V1").size(), std::size_t(1));
+
+    // A marker 25 frames after the clip; a clip dragged near it snaps onto it.
+    const Time clipStart = track("V2").findClip(second)->start;
+    const Time markerAt = clipStart + frame(25);
+    w.seekTo(markerAt);
+    QTRY_COMPARE(w.playheadPosition(), markerAt);
+    action("actionAddMarker")->trigger();
+    QCOMPARE(tl().markers.size(), std::size_t(1));
+    QCOMPARE(tl().markers[0].start, markerAt);
+    w.seekTo(Time(0)); // keep the playhead out of the snapping
+    QTRY_COMPARE(w.playheadPosition(), Time(0));
+    from = timeline->clipRect(second).center();
+    drag(from, from + QPoint(timeline->xForTime(markerAt) - timeline->xForTime(clipStart) + 3, 0));
+    QCOMPARE(track("V2").findClip(second)->start, markerAt);
+    QCOMPARE(track("A2").findClip(secondSound)->start, markerAt);
+
+    // The marker dragged near the end of the first clip snaps onto that cut.
+    const ve::Id marker = tl().markers[0].id;
+    from = timeline->markerPoint(marker);
+    drag(from, QPoint(timeline->xForTime(rolledCut) - 3, from.y()));
+    QCOMPARE(tl().markers[0].start, rolledCut);
+    QVERIFY(undoText().contains(QStringLiteral("Move Marker")));
+
+    // The lock in A1's header: deleting the first take then leaves its sound alone.
+    QTest::mouseClick(timeline, Qt::LeftButton, {}, timeline->trackFlagRect(track("A1").id, TimelineWidget::TrackFlag::Lock).center());
+    QVERIFY(track("A1").locked);
+    QTest::mouseClick(timeline, Qt::LeftButton, {}, timeline->clipRect(clips("V1")[0].clip->id).center());
+    action("actionDelete")->trigger();
+    QVERIFY(clips("V1").empty());
+    QCOMPARE(clips("A1").size(), std::size_t(1));
+    action("actionUndo")->trigger();
+    QCOMPARE(clips("V1").size(), std::size_t(1));
+    QTest::mouseClick(timeline, Qt::LeftButton, {}, timeline->trackFlagRect(track("A1").id, TimelineWidget::TrackFlag::Lock).center());
+    QVERIFY(!track("A1").locked);
+
+    // Insert (F9) of the pool's media at the start: everything moves right by its length, on every
+    // sync-locked track, and the playhead lands after the new clip.
+    const Time before = tl().duration();
+    w.seekTo(Time(0));
+    QTRY_COMPARE(w.playheadPosition(), Time(0));
+    QVERIFY(action("actionInsert")->isEnabled());
+    action("actionInsert")->trigger();
+    QCOMPARE(tl().duration(), before + frame(240));
+    QCOMPARE(clips("V1")[0].end(), frame(240));
+    QCOMPARE(track("V2").findClip(second)->start, markerAt + frame(240));
+    QTRY_COMPARE(w.playheadPosition(), frame(240));
+    QCOMPARE(tl().markers[0].start, rolledCut); // markers belong to the timeline, not to clips
+
+    QVERIFY(ve::edit::checkInvariants(tl(), w.project().media).empty());
+    QVERIFY(ve::edit::checkSync(tl()).empty());
+    if (const QString shot = qEnvironmentVariable("VE_UI_SCREENSHOT"); !shot.isEmpty()) {
+        timeline->zoomToFit();
+        QTest::qWait(300);
+        QString path = shot;
+        path.insert(path.lastIndexOf(QLatin1Char('.')), QStringLiteral("_phase2"));
+        w.grab().save(path);
+    }
 }
 
 QTEST_MAIN(UiTests)

@@ -55,6 +55,33 @@ void MediaPoolWidget::setMedia(const ve::MediaPool& pool, ve::Rate timelineRate)
     }
 }
 
+QString MediaPoolWidget::sourceMediaId() const
+{
+    const QList<QListWidgetItem*> selected = selectedItems();
+    if (!selected.isEmpty()) {
+        QListWidgetItem* first = selected.front();
+        for (QListWidgetItem* item : selected) {
+            if (row(item) < row(first))
+                first = item;
+        }
+        return first->data(Qt::UserRole).toString();
+    }
+    if (count() == 1)
+        return item(0)->data(Qt::UserRole).toString();
+    return {};
+}
+
+void MediaPoolWidget::selectMedia(const QString& mediaId)
+{
+    clearSelection();
+    for (int i = 0; i < count(); ++i) {
+        if (item(i)->data(Qt::UserRole).toString() == mediaId) {
+            item(i)->setSelected(true);
+            setCurrentRow(i);
+        }
+    }
+}
+
 QStringList MediaPoolWidget::mimeTypes() const
 {
     return {QString::fromLatin1(kMediaMimeType), QStringLiteral("text/uri-list")};

@@ -195,10 +195,17 @@ if(VE_BUILD_TESTS)
         tests/core/test_time.cpp
         tests/core/test_json.cpp
         tests/core/test_edit.cpp
+        tests/core/test_three_point.cpp
+        tests/core/test_trims.cpp
+        tests/core/test_compound.cpp
+        tests/core/test_tracks_markers.cpp
+        tests/core/test_golden.cpp
         tests/core/test_commands.cpp
         tests/core/test_project_file.cpp
         tests/core/test_property.cpp)
     target_link_libraries(ve_core_tests PRIVATE ve_core catch2)
+    # Golden states (before/after JSON of every edit); VE_UPDATE_GOLDEN=1 rewrites them.
+    target_compile_definitions(ve_core_tests PRIVATE VE_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/core/golden")
     add_test(NAME ve_core_tests COMMAND ve_core_tests --order rand --warn NoAssertions)
 
     if(VE_BUILD_APP)

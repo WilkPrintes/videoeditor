@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <string>
 
@@ -15,9 +16,26 @@ Id newId();
 class IdRemap {
 public:
     const Id& operator()(const Id& old);
+    // The replacement given to `old` so far, or nullptr.
+    const Id* find(const Id& old) const;
 
 private:
     std::map<Id, Id> m_map;
+};
+
+// Test support: while one is alive, newId() on this thread returns "<prefix>0001", "<prefix>0002"...
+// so golden states are reproducible. Scopes nest; the previous sequence comes back on destruction.
+class ScopedIdSequence {
+public:
+    explicit ScopedIdSequence(std::string prefix = "id");
+    ~ScopedIdSequence();
+    ScopedIdSequence(const ScopedIdSequence&) = delete;
+    ScopedIdSequence& operator=(const ScopedIdSequence&) = delete;
+
+private:
+    bool m_wasActive;
+    std::string m_previousPrefix;
+    std::uint64_t m_previousNext;
 };
 
 } // namespace ve

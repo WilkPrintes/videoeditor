@@ -56,6 +56,37 @@ private:
     bool m_executed = false;
 };
 
+// An edit that may create or remove timelines (compound clips, spec §6.3). Same idea as
+// TimelineEditCommand, with snapshots of every timeline of the project (not of the media pool,
+// which the operation must leave alone).
+class ProjectEditCommand final : public Command {
+public:
+    using Operation = std::function<bool(Project&)>;
+
+    ProjectEditCommand(std::string name, Operation op, std::string mergeKey = {});
+
+    std::string name() const override { return m_name; }
+    bool redo(Project& project) override;
+    void undo(Project& project) override;
+    bool mergeWith(const Command& next) const override;
+
+private:
+    struct State {
+        std::vector<Timeline> timelines;
+        Id current;
+        bool operator==(const State&) const = default;
+    };
+    static State capture(const Project& project);
+    static void restore(Project& project, const State& state);
+
+    std::string m_name;
+    Operation m_op;
+    std::string m_mergeKey;
+    State m_before;
+    State m_after;
+    bool m_executed = false;
+};
+
 // Adds a media item to the pool (and to the root folder).
 class AddMediaCommand final : public Command {
 public:
@@ -97,6 +128,7 @@ public:
     // transaction (merging with the previous command when mergeWith() says so). False = no change.
     bool push(std::unique_ptr<Command> cmd);
     bool edit(std::string name, TimelineEditCommand::Operation op, std::string mergeKey = {});
+    bool editProject(std::string name, ProjectEditCommand::Operation op, std::string mergeKey = {});
 
     void beginTransaction(std::string name);
     bool commit(); // true if the transaction changed something (one new undo step)

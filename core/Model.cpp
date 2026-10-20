@@ -63,6 +63,36 @@ Time durationOf(const Item& item)
     return Time(0); // transitions overlap their neighbours
 }
 
+namespace {
+
+const Retime* retimeOf(const Item& item)
+{
+    const Clip* c = std::get_if<Clip>(&item);
+    return c && c->retime.isValid() && !c->retime.isIdentity() ? &c->retime : nullptr;
+}
+
+} // namespace
+
+Time sourceOffset(const Item& item, Time clipTime)
+{
+    if (const Retime* r = retimeOf(item))
+        return Time(mulDivFloor(clipTime.flicks, r->speedNum, r->speedDen));
+    return clipTime;
+}
+
+Time clipTimeFor(const Item& item, Time sourceTime)
+{
+    if (const Retime* r = retimeOf(item))
+        return Time(mulDivFloor(sourceTime.flicks, r->speedDen, r->speedNum));
+    return sourceTime;
+}
+
+Time sourceEnd(const Item& item)
+{
+    const ClipBase* c = clipBase(item);
+    return c ? c->sourceRange.start + sourceOffset(item, c->sourceRange.duration) : Time(0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Track queries
 // ---------------------------------------------------------------------------------------------
@@ -111,12 +141,12 @@ std::optional<PlacedItem> Track::findClip(const Id& clipId) const
 
 namespace {
 
-// The part of `item` starting `offset` into it and lasting `length`.
+// The part of `item` starting `offset` into it and lasting `length` (timeline time).
 Item slice(const Item& item, Time offset, Time length)
 {
     Item out = item;
     if (ClipBase* c = clipBase(out)) {
-        c->sourceRange.start += offset;
+        c->sourceRange.start += sourceOffset(item, offset);
         c->sourceRange.duration = length;
         return out;
     }
@@ -217,6 +247,48 @@ bool Track::splitAt(Time t, IdRemap& links)
         pos += d;
     }
     return false;
+}
+
+void Track::insertSpace(Time at, Time length, IdRemap& links)
+{
+    at = std::max(at, Time(0));
+    if (length <= Time(0) || at >= duration())
+        return;
+    splitAt(at, links); // now `at` is a cut or lies inside a gap
+    Time pos;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        const Time d = durationOf(items[i]);
+        if (Gap* g = std::get_if<Gap>(&items[i]); g && pos < at && at < pos + d) {
+            g->duration += length;
+            break;
+        }
+        if (pos == at && d > Time(0)) {
+            items.insert(items.begin() + std::ptrdiff_t(i), Gap{length});
+            break;
+        }
+        pos += d;
+    }
+    normalizeImpl(true);
+}
+
+void Track::removeRange(Time start, Time end, IdRemap& links)
+{
+    start = std::max(start, Time(0));
+    if (end <= start || start >= duration())
+        return;
+    // Lift the range, then take its (now empty) time out of the gaps that cover it.
+    liftRangeKeepTail(start, end, links);
+    Time pos;
+    for (Item& item : items) {
+        const Time d = durationOf(item);
+        if (Gap* g = std::get_if<Gap>(&item)) {
+            const Time overlap = std::min(pos + d, end) - std::max(pos, start);
+            if (overlap > Time(0))
+                g->duration -= overlap;
+        }
+        pos += d;
+    }
+    normalizeImpl(true);
 }
 
 void Track::normalize()

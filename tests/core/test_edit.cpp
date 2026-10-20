@@ -222,7 +222,7 @@ TEST_CASE("compound and multicam items edit like clips", "[model]")
     REQUIRE(src);
     CHECK(src->media->id == f.media.id);
     CHECK(src->sourceTime == F(10));
-    CHECK_FALSE(resolveVideo(*snap, F(370))); // compounds are not rendered yet
+    CHECK_FALSE(resolveVideo(*snap, F(370))); // a compound whose nested timeline is missing shows nothing
 }
 
 TEST_CASE("snapshot resolves the picture under the playhead", "[engine-facing]")

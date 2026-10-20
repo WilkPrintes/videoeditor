@@ -30,39 +30,30 @@ AudioDecoder* AudioMixer::decoderFor(const std::string& key, const MediaItem& me
 void AudioMixer::mix(const TimelineSnapshot& snap, std::int64_t start, int frames, float* out)
 {
     std::fill(out, out + std::size_t(frames) * 2, 0.0f);
-    const Timeline& tl = snap.timeline;
     const std::int64_t end = start + frames;
 
-    for (const Track& track : tl.tracks) {
-        if (track.kind != TrackKind::Audio || !track.enabled)
+    // Compound clips arrive expanded; the order is the track order, so a composed timeline sums the
+    // same samples in the same order as the original (bit-identical output).
+    for (const AudioSegment& seg :
+         audioSegments(snap, timeOfSample(start, m_sampleRate), timeOfSample(end, m_sampleRate))) {
+        const std::int64_t s0 = std::max(sampleAt(seg.start, m_sampleRate), start);
+        const std::int64_t s1 = std::min(sampleAt(seg.end, m_sampleRate), end);
+        if (s0 >= s1)
             continue;
-        for (const PlacedItem& placed : track.clips()) {
-            const Clip* clip = std::get_if<Clip>(placed.item);
-            if (!clip || !clip->enabled)
-                continue; // compound/multicam audio is not mixed yet
-            const std::int64_t clipStart = sampleAt(placed.start, m_sampleRate);
-            const std::int64_t clipEnd = sampleAt(placed.end(), m_sampleRate);
-            const std::int64_t s0 = std::max(clipStart, start);
-            const std::int64_t s1 = std::min(clipEnd, end);
-            if (s0 >= s1)
-                continue;
-            const MediaItem* media = snap.findMedia(clip->mediaId);
-            if (!media || !media->hasAudio)
-                continue;
-            AudioDecoder* dec = decoderFor(track.id + "|" + media->id, *media);
-            if (!dec)
-                continue;
+        AudioDecoder* dec = decoderFor(seg.key, *seg.media);
+        if (!dec)
+            continue;
 
-            const int n = int(s1 - s0);
-            // Source sample = where the clip starts in its media + how far into the clip we are.
-            const std::int64_t sourceSample = sampleAt(clip->sourceRange.start, m_sampleRate) + (s0 - clipStart);
-            m_scratch.resize(std::size_t(n) * 2);
-            dec->read(sourceSample, m_scratch.data(), n);
+        const int n = int(s1 - s0);
+        // Source sample = where the media is at the clip's origin + how far past it we are.
+        const std::int64_t sourceSample =
+            sampleAt(seg.sourceOrigin, m_sampleRate) + (s0 - sampleAt(seg.origin, m_sampleRate));
+        m_scratch.resize(std::size_t(n) * 2);
+        dec->read(sourceSample, m_scratch.data(), n);
 
-            float* dst = out + std::size_t(s0 - start) * 2;
-            for (std::size_t i = 0; i < m_scratch.size(); ++i)
-                dst[i] += m_scratch[i];
-        }
+        float* dst = out + std::size_t(s0 - start) * 2;
+        for (std::size_t i = 0; i < m_scratch.size(); ++i)
+            dst[i] += m_scratch[i];
     }
 
     for (std::size_t i = 0; i < std::size_t(frames) * 2; ++i)

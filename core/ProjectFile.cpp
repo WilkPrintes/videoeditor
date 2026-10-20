@@ -1,5 +1,6 @@
 #include "core/ProjectFile.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -368,6 +369,18 @@ json::Value timelineToJson(const Timeline& tl)
     o.set("height", tl.height);
     o.set("sample_rate", tl.sampleRate);
     o.set("tracks", std::move(tracks));
+    Value markers = Value::array();
+    for (const Marker& m : tl.markers) {
+        Value mo = Value::object();
+        mo.set("schema", "Marker.1");
+        mo.set("id", m.id);
+        mo.set("name", m.name);
+        mo.set("note", m.note);
+        mo.set("color", m.color);
+        mo.set("marked_range", rangeValue({m.start, m.duration}));
+        markers.push(std::move(mo));
+    }
+    o.set("markers", std::move(markers));
     return o;
 }
 
@@ -395,6 +408,20 @@ Timeline timelineFromJson(const json::Value& o)
         t.normalize();
         tl.tracks.push_back(std::move(t));
     }
+    for (const Value& mo : o["markers"].asArray()) {
+        const TimeRange range = rangeOf(mo["marked_range"]);
+        Marker m;
+        m.id = mo["id"].asString();
+        m.name = mo["name"].asString();
+        m.note = mo["note"].asString();
+        m.color = mo["color"].asString();
+        if (m.color.empty())
+            m.color = "blue";
+        m.start = range.start;
+        m.duration = range.duration;
+        tl.markers.push_back(std::move(m));
+    }
+    std::stable_sort(tl.markers.begin(), tl.markers.end(), [](const Marker& a, const Marker& b) { return a.start < b.start; });
     return tl;
 }
 

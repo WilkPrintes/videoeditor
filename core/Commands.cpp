@@ -53,6 +53,56 @@ bool TimelineEditCommand::mergeWith(const Command& next) const
 }
 
 // ---------------------------------------------------------------------------------------------
+// ProjectEditCommand
+// ---------------------------------------------------------------------------------------------
+
+ProjectEditCommand::ProjectEditCommand(std::string name, Operation op, std::string mergeKey)
+    : m_name(std::move(name))
+    , m_op(std::move(op))
+    , m_mergeKey(std::move(mergeKey))
+{
+}
+
+ProjectEditCommand::State ProjectEditCommand::capture(const Project& project)
+{
+    return {project.timelines, project.currentTimeline};
+}
+
+void ProjectEditCommand::restore(Project& project, const State& state)
+{
+    project.timelines = state.timelines;
+    project.currentTimeline = state.current;
+}
+
+bool ProjectEditCommand::redo(Project& project)
+{
+    if (!m_executed) {
+        m_executed = true;
+        m_before = capture(project);
+        if (!m_op(project) || capture(project) == m_before) {
+            restore(project, m_before);
+            return false;
+        }
+        m_after = capture(project);
+        m_op = nullptr;
+        return true;
+    }
+    restore(project, m_after);
+    return true;
+}
+
+void ProjectEditCommand::undo(Project& project)
+{
+    restore(project, m_before);
+}
+
+bool ProjectEditCommand::mergeWith(const Command& next) const
+{
+    const auto* other = dynamic_cast<const ProjectEditCommand*>(&next);
+    return other && !m_mergeKey.empty() && other->m_mergeKey == m_mergeKey;
+}
+
+// ---------------------------------------------------------------------------------------------
 // AddMediaCommand
 // ---------------------------------------------------------------------------------------------
 
@@ -143,6 +193,11 @@ bool CommandStack::push(std::unique_ptr<Command> cmd)
 bool CommandStack::edit(std::string name, TimelineEditCommand::Operation op, std::string mergeKey)
 {
     return push(std::make_unique<TimelineEditCommand>(std::move(name), std::move(op), std::move(mergeKey)));
+}
+
+bool CommandStack::editProject(std::string name, ProjectEditCommand::Operation op, std::string mergeKey)
+{
+    return push(std::make_unique<ProjectEditCommand>(std::move(name), std::move(op), std::move(mergeKey)));
 }
 
 void CommandStack::beginTransaction(std::string name)

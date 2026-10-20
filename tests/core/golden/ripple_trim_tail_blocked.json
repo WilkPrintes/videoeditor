@@ -1,0 +1,438 @@
+{
+  "operation": "ripple_trim_tail_blocked",
+  "description": "The same ripple with A2 sync-locked: the music spans the cut, so it is refused.",
+  "applied": false,
+  "before": {
+    "summary": [
+      "V1: [0,100) a.mp4 src 0 link id0011 | [100,300) a.mp4 src 100 link id0015 | [300,420) b.mp4 src 0 link id0017",
+      "V2: gap 150 | [150,240) title.mov src 0",
+      "A1: [0,100) a.mp4 src 0 link id0011 | [100,300) a.mp4 src 100 link id0015 | [300,420) b.mp4 src 0 link id0017",
+      "A2: [0,600) music.wav src 0"
+    ],
+    "timeline": {
+      "schema": "Timeline.1",
+      "id": "id0001",
+      "name": "Timeline 1",
+      "rate": {
+        "num": 30,
+        "den": 1
+      },
+      "width": 1920,
+      "height": 1080,
+      "sample_rate": 48000,
+      "tracks": [
+        {
+          "schema": "Track.1",
+          "id": "id0002",
+          "name": "V1",
+          "kind": "video",
+          "enabled": true,
+          "locked": false,
+          "sync_lock": true,
+          "children": [
+            {
+              "schema": "Clip.1",
+              "id": "id0012",
+              "name": "a.mp4",
+              "source_range": {
+                "start": 0,
+                "duration": 2352000000
+              },
+              "enabled": true,
+              "link_group": "id0011",
+              "media_id": "id0005",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0014",
+              "name": "a.mp4",
+              "source_range": {
+                "start": 2352000000,
+                "duration": 4704000000
+              },
+              "enabled": true,
+              "link_group": "id0015",
+              "media_id": "id0005",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0018",
+              "name": "b.mp4",
+              "source_range": {
+                "start": 0,
+                "duration": 2822400000
+              },
+              "enabled": true,
+              "link_group": "id0017",
+              "media_id": "id0006",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            }
+          ]
+        },
+        {
+          "schema": "Track.1",
+          "id": "id0009",
+          "name": "V2",
+          "kind": "video",
+          "enabled": true,
+          "locked": false,
+          "sync_lock": true,
+          "children": [
+            {
+              "schema": "Gap.1",
+              "duration": 3528000000
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0020",
+              "name": "title.mov",
+              "source_range": {
+                "start": 0,
+                "duration": 2116800000
+              },
+              "enabled": true,
+              "link_group": "",
+              "media_id": "id0007",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            }
+          ]
+        },
+        {
+          "schema": "Track.1",
+          "id": "id0003",
+          "name": "A1",
+          "kind": "audio",
+          "enabled": true,
+          "locked": false,
+          "sync_lock": true,
+          "children": [
+            {
+              "schema": "Clip.1",
+              "id": "id0013",
+              "name": "a.mp4",
+              "source_range": {
+                "start": 0,
+                "duration": 2352000000
+              },
+              "enabled": true,
+              "link_group": "id0011",
+              "media_id": "id0005",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0016",
+              "name": "a.mp4",
+              "source_range": {
+                "start": 2352000000,
+                "duration": 4704000000
+              },
+              "enabled": true,
+              "link_group": "id0015",
+              "media_id": "id0005",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0019",
+              "name": "b.mp4",
+              "source_range": {
+                "start": 0,
+                "duration": 2822400000
+              },
+              "enabled": true,
+              "link_group": "id0017",
+              "media_id": "id0006",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            }
+          ]
+        },
+        {
+          "schema": "Track.1",
+          "id": "id0010",
+          "name": "A2",
+          "kind": "audio",
+          "enabled": true,
+          "locked": false,
+          "sync_lock": true,
+          "children": [
+            {
+              "schema": "Clip.1",
+              "id": "id0021",
+              "name": "music.wav",
+              "source_range": {
+                "start": 0,
+                "duration": 14112000000
+              },
+              "enabled": true,
+              "link_group": "",
+              "media_id": "id0008",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            }
+          ]
+        }
+      ],
+      "markers": []
+    },
+    "nested_timelines": []
+  },
+  "after": {
+    "summary": [
+      "V1: [0,100) a.mp4 src 0 link id0011 | [100,300) a.mp4 src 100 link id0015 | [300,420) b.mp4 src 0 link id0017",
+      "V2: gap 150 | [150,240) title.mov src 0",
+      "A1: [0,100) a.mp4 src 0 link id0011 | [100,300) a.mp4 src 100 link id0015 | [300,420) b.mp4 src 0 link id0017",
+      "A2: [0,600) music.wav src 0"
+    ],
+    "timeline": {
+      "schema": "Timeline.1",
+      "id": "id0001",
+      "name": "Timeline 1",
+      "rate": {
+        "num": 30,
+        "den": 1
+      },
+      "width": 1920,
+      "height": 1080,
+      "sample_rate": 48000,
+      "tracks": [
+        {
+          "schema": "Track.1",
+          "id": "id0002",
+          "name": "V1",
+          "kind": "video",
+          "enabled": true,
+          "locked": false,
+          "sync_lock": true,
+          "children": [
+            {
+              "schema": "Clip.1",
+              "id": "id0012",
+              "name": "a.mp4",
+              "source_range": {
+                "start": 0,
+                "duration": 2352000000
+              },
+              "enabled": true,
+              "link_group": "id0011",
+              "media_id": "id0005",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0014",
+              "name": "a.mp4",
+              "source_range": {
+                "start": 2352000000,
+                "duration": 4704000000
+              },
+              "enabled": true,
+              "link_group": "id0015",
+              "media_id": "id0005",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0018",
+              "name": "b.mp4",
+              "source_range": {
+                "start": 0,
+                "duration": 2822400000
+              },
+              "enabled": true,
+              "link_group": "id0017",
+              "media_id": "id0006",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            }
+          ]
+        },
+        {
+          "schema": "Track.1",
+          "id": "id0009",
+          "name": "V2",
+          "kind": "video",
+          "enabled": true,
+          "locked": false,
+          "sync_lock": true,
+          "children": [
+            {
+              "schema": "Gap.1",
+              "duration": 3528000000
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0020",
+              "name": "title.mov",
+              "source_range": {
+                "start": 0,
+                "duration": 2116800000
+              },
+              "enabled": true,
+              "link_group": "",
+              "media_id": "id0007",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            }
+          ]
+        },
+        {
+          "schema": "Track.1",
+          "id": "id0003",
+          "name": "A1",
+          "kind": "audio",
+          "enabled": true,
+          "locked": false,
+          "sync_lock": true,
+          "children": [
+            {
+              "schema": "Clip.1",
+              "id": "id0013",
+              "name": "a.mp4",
+              "source_range": {
+                "start": 0,
+                "duration": 2352000000
+              },
+              "enabled": true,
+              "link_group": "id0011",
+              "media_id": "id0005",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0016",
+              "name": "a.mp4",
+              "source_range": {
+                "start": 2352000000,
+                "duration": 4704000000
+              },
+              "enabled": true,
+              "link_group": "id0015",
+              "media_id": "id0005",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            },
+            {
+              "schema": "Clip.1",
+              "id": "id0019",
+              "name": "b.mp4",
+              "source_range": {
+                "start": 0,
+                "duration": 2822400000
+              },
+              "enabled": true,
+              "link_group": "id0017",
+              "media_id": "id0006",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            }
+          ]
+        },
+        {
+          "schema": "Track.1",
+          "id": "id0010",
+          "name": "A2",
+          "kind": "audio",
+          "enabled": true,
+          "locked": false,
+          "sync_lock": true,
+          "children": [
+            {
+              "schema": "Clip.1",
+              "id": "id0021",
+              "name": "music.wav",
+              "source_range": {
+                "start": 0,
+                "duration": 14112000000
+              },
+              "enabled": true,
+              "link_group": "",
+              "media_id": "id0008",
+              "effects": [],
+              "grade": [],
+              "retime": {
+                "speed_num": 1,
+                "speed_den": 1
+              }
+            }
+          ]
+        }
+      ],
+      "markers": []
+    },
+    "nested_timelines": []
+  }
+}
+

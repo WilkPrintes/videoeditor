@@ -70,7 +70,22 @@ private:
     void stepFrames(std::int64_t frames);
     void splitAtPlayhead();
     void deleteSelection();
-    void placeMediaAt(const QString& mediaId, std::optional<ve::Time> at);
+    void rippleDeleteSelection();
+    void placeMediaAt(const QString& mediaId, std::optional<ve::Time> at, const QString& trackId = {});
+
+    // Three and four point edits of the media pool's source onto the destination tracks (spec §6.1).
+    enum class SourceEdit { Insert, Overwrite, Replace, FitToFill, PlaceOnTop };
+    void sourceEdit(SourceEdit kind);
+    bool editProject(const QString& name, ve::ProjectEditCommand::Operation op);
+    void composeSelection();
+    void decomposeSelection();
+    void addTrack(ve::TrackKind kind);
+    void markIn();
+    void markOut();
+    void clearMarks();
+    void addMarker();
+    void jumpToEdit(int direction);   // previous (-1) / next (+1) cut
+    void jumpToMarker(int direction); // previous / next marker
 
     ve::Project m_project;
     ve::CommandStack m_commands{m_project};
@@ -89,7 +104,14 @@ private:
     QAction* m_redoAction = nullptr;
     QAction* m_splitAction = nullptr;
     QAction* m_deleteAction = nullptr;
+    QAction* m_rippleDeleteAction = nullptr;
     QAction* m_exportAction = nullptr;
+    QList<QAction*> m_sourceEditActions;
+    QAction* m_composeAction = nullptr;
+    QAction* m_decomposeAction = nullptr;
+
+    std::optional<ve::Time> m_markIn;
+    std::optional<ve::Time> m_markOut;
 
     QTimer m_ticker;
     QString m_projectPath;

@@ -7,6 +7,7 @@
 #include "media/VideoDecoder.h"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <vector>
@@ -17,17 +18,39 @@ namespace {
 
 bool timelineHasAudio(const TimelineSnapshot& snap)
 {
-    for (const Track& t : snap.timeline.tracks) {
-        if (t.kind != TrackKind::Audio || !t.enabled)
-            continue;
-        for (const PlacedItem& p : t.clips()) {
-            const Clip* clip = std::get_if<Clip>(p.item);
-            const MediaItem* m = clip ? snap.findMedia(clip->mediaId) : nullptr;
-            if (m && m->hasAudio)
-                return true;
-        }
+    return !audioSegments(snap, Time(0), snap.timeline.duration()).empty();
+}
+
+// FNV-1a over 64-bit words: a fingerprint for comparing renders, not a cryptographic hash.
+constexpr std::uint64_t kHashSeed = 0xcbf29ce484222325ULL;
+
+std::uint64_t hashBytes(std::uint64_t h, const void* data, std::size_t n)
+{
+    constexpr std::uint64_t kPrime = 0x100000001b3ULL;
+    const auto* p = static_cast<const unsigned char*>(data);
+    for (; n >= 8; n -= 8, p += 8) {
+        std::uint64_t word;
+        std::memcpy(&word, p, 8);
+        h = (h ^ word) * kPrime;
     }
-    return false;
+    for (; n > 0; --n)
+        h = (h ^ *p++) * kPrime;
+    return h;
+}
+
+std::uint64_t hashPicture(std::uint64_t h, const AVFrame* frame)
+{
+    const auto format = AVPixelFormat(frame->format);
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(format);
+    if (!desc)
+        return h;
+    for (int plane = 0; plane < av_pix_fmt_count_planes(format); ++plane) {
+        const int bytes = av_image_get_linesize(format, frame->width, plane);
+        const int rows = plane == 0 ? frame->height : AV_CEIL_RSHIFT(frame->height, int(desc->log2_chroma_h));
+        for (int y = 0; y < rows; ++y)
+            h = hashBytes(h, frame->data[plane] + std::ptrdiff_t(y) * frame->linesize[plane], std::size_t(bytes));
+    }
+    return h;
 }
 
 ExportResult runExport(const TimelineSnapshot& snap, const ExportSettings& settings, const ExportProgress& progress)
@@ -57,6 +80,10 @@ ExportResult runExport(const TimelineSnapshot& snap, const ExportSettings& setti
     AudioMixer mixer(kEncodeAudioRate);
     std::vector<float> audio;
     std::int64_t samplesMixed = 0;
+    if (settings.renderHash) {
+        res.videoHash = kHashSeed;
+        res.audioHash = kHashSeed;
+    }
 
     for (std::int64_t f = 0; f < total; ++f) {
         // Picture: the topmost clip under this frame, or black.
@@ -78,6 +105,8 @@ ExportResult runExport(const TimelineSnapshot& snap, const ExportSettings& setti
                     scaler.scaleInto(*decoded, picture);
             }
         }
+        if (settings.renderHash)
+            res.videoHash = hashPicture(res.videoHash, picture);
         int r = writer.writeVideoFrame(f);
         if (r < 0) {
             res.error = "Video encoding failed: " + ff::errorString(r);
@@ -91,6 +120,8 @@ ExportResult runExport(const TimelineSnapshot& snap, const ExportSettings& setti
             audio.resize(std::size_t(std::max(n, 0)) * 2);
             if (n > 0)
                 mixer.mix(snap, samplesMixed, n, audio.data());
+            if (settings.renderHash)
+                res.audioHash = hashBytes(res.audioHash, audio.data(), audio.size() * sizeof(float));
             samplesMixed = target;
             r = writer.writeAudio(audio.data(), n);
             if (r < 0) {

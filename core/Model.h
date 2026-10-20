@@ -106,11 +106,16 @@ struct Grade {
     bool operator==(const Grade&) const = default;
 };
 
-// Constant speed for now (num/den, 1/1 = normal). Keyframed TimeMaps come with spec §6.5; edit
-// operations currently assume 1/1.
+// Constant speed (num/den: 1/1 = normal, 2/1 = twice as fast). As with OpenTimelineIO's
+// LinearTimeWarp, the clip still takes sourceRange.duration of timeline time; it reads
+// sourceOffset() of media over it. Fit to fill sets it (spec §6.1); keyframed TimeMaps come with
+// spec §6.5.
 struct Retime {
     int speedNum = 1;
     int speedDen = 1;
+
+    bool isIdentity() const { return speedNum == speedDen; }
+    bool isValid() const { return speedNum > 0 && speedDen > 0; }
     bool operator==(const Retime&) const = default;
 };
 
@@ -122,7 +127,9 @@ struct Retime {
 struct ClipBase {
     Id id;
     std::string name;
-    TimeRange sourceRange; // media time (for compounds: time in the nested timeline)
+    // start: media time of the first frame (for compounds: time in the nested timeline).
+    // duration: time the item takes in the timeline (the media read is sourceOffset(duration)).
+    TimeRange sourceRange;
     bool enabled = true;
     Id linkGroup;          // items sharing a non-empty group edit together (picture + sound)
 
@@ -174,6 +181,14 @@ Time durationOf(const Item& item);
 const ClipBase* clipBase(const Item& item); // nullptr for gaps and transitions
 ClipBase* clipBase(Item& item);
 
+// Media time read during `clipTime` of the item's timeline time: scaled by the speed of a retimed
+// clip, unchanged for everything else. Floors, so a clip never reads past what it covers.
+Time sourceOffset(const Item& item, Time clipTime);
+// The inverse (floored): how much timeline time `sourceTime` of media lasts.
+Time clipTimeFor(const Item& item, Time sourceTime);
+// Media time just after the last frame the item shows.
+Time sourceEnd(const Item& item);
+
 // ---------------------------------------------------------------------------------------------
 // Tracks and timelines
 // ---------------------------------------------------------------------------------------------
@@ -210,6 +225,11 @@ struct Track {
     void placeItem(Time start, Item item, IdRemap& links);
     // Splits the clip-like item strictly spanning t. False when nothing was split.
     bool splitAt(Time t, IdRemap& links);
+    // Ripple primitives. insertSpace opens `length` of empty time at `at`: an item spanning `at` is
+    // split and everything from `at` on moves right (nothing happens past the end of the track).
+    // removeRange cuts [start, end) out and closes the hole: everything after moves left.
+    void insertSpace(Time at, Time length, IdRemap& links);
+    void removeRange(Time start, Time end, IdRemap& links);
     // Merges adjacent gaps, drops empty items, dangling transitions and trailing gaps.
     void normalize();
 
@@ -220,6 +240,19 @@ private:
     void normalizeImpl(bool trimTrailingGaps);
 };
 
+// A timeline marker (spec §6.8): a point (duration 0) or a range, with a colour and notes. Markers
+// belong to the timeline, not to clips: moving or rippling clips leaves them where they are.
+struct Marker {
+    Id id;
+    Time start;
+    Time duration;
+    std::string name;
+    std::string note;
+    std::string color = "blue";
+
+    bool operator==(const Marker&) const = default;
+};
+
 struct Timeline {
     Id id;
     std::string name = "Timeline 1";
@@ -227,7 +260,9 @@ struct Timeline {
     int width = 1920;
     int height = 1080;
     int sampleRate = 48000;
-    std::vector<Track> tracks; // any order; the UI shows video above audio
+    // Any order between kinds; within a kind, later tracks are higher (V2 composites over V1).
+    std::vector<Track> tracks;
+    std::vector<Marker> markers; // sorted by start
 
     Time duration() const;
     Track* track(const Id& trackId);

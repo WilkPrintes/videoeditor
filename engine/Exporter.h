@@ -16,6 +16,9 @@ struct ExportSettings {
     int videoBitrateKbps = 12000;
     int audioBitrateKbps = 192;
     std::string videoEncoder = "auto"; // or an FFmpeg encoder name, e.g. "h264_nvenc"
+    // Fingerprint every rendered picture and the mixed sound before encoding (ExportResult hashes),
+    // so two renders can be compared exactly whatever the encoder does.
+    bool renderHash = false;
 };
 
 struct ExportResult {
@@ -24,6 +27,8 @@ struct ExportResult {
     std::string error;
     std::string videoEncoder; // the encoder that was actually used
     std::int64_t framesWritten = 0;
+    std::uint64_t videoHash = 0; // with ExportSettings::renderHash
+    std::uint64_t audioHash = 0;
 };
 
 // Progress in [0, 1]; return false to cancel.

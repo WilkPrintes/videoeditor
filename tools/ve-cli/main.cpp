@@ -4,7 +4,8 @@
 //   ve-cli probe <media>
 //   ve-cli encoders
 //   ve-cli make-test-clip <out.mp4> [seconds] [width] [height] [fps]
-//   ve-cli selftest <media> <out.mp4>          import, cut, move, drag gesture, trim, undo, save, export
+//   ve-cli selftest <media> <out.mp4>          import, cut, move, drag gesture, trim, undo, save, export,
+//                                              then the phase 2 edits and the compound render hash
 //   ve-cli render <project.veproj> <out.mp4> [encoder]
 //   ve-cli play <media> [seconds]              plays through the audio device, reports A/V sync
 
@@ -18,6 +19,7 @@
 #include "media/TestPattern.h"
 
 #include <QCoreApplication>
+#include <QFile>
 #include <QStringList>
 
 #include <algorithm>
@@ -88,7 +90,7 @@ void dumpTimeline(const Timeline& tl)
     }
 }
 
-bool exportWithProgress(const TimelineSnapshot& snap, const ExportSettings& settings)
+bool exportWithProgress(const TimelineSnapshot& snap, const ExportSettings& settings, ExportResult* result = nullptr)
 {
     int lastTenth = -1;
     const auto t0 = std::chrono::steady_clock::now();
@@ -102,6 +104,8 @@ bool exportWithProgress(const TimelineSnapshot& snap, const ExportSettings& sett
         return true;
     });
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (result)
+        *result = res;
     if (!res.ok) {
         std::fprintf(stderr, "export failed: %s\n", res.error.c_str());
         return false;
@@ -215,6 +219,132 @@ int cmdSelftest(const std::string& mediaPath, const std::string& outPath)
             check(!media->hasAudio || (out->hasAudio && out->audioCodec == "aac"), "output audio is AAC");
         }
     }
+
+    // Phase 2 (spec §6.1-6.3) on real media: every edit keeps the invariants and picture/sound in sync,
+    // undo brings everything back, and a compound clip renders exactly the frames and samples of what
+    // it replaced (hashed before encoding, so the encoder plays no part).
+    std::printf("phase 2:\n");
+    const Project beforePhase2 = project;
+    int phase2Steps = 0;
+    auto syncHolds = [&] {
+        const std::string problems = edit::checkSync(project.timeline());
+        if (!problems.empty())
+            std::printf("%s", problems.c_str());
+        return problems.empty();
+    };
+    auto step = [&](const char* what, TimelineEditCommand::Operation op) {
+        const bool applied = stack.edit(what, std::move(op));
+        phase2Steps += applied ? 1 : 0;
+        check(applied && invariantsHold() && syncHolds(), what);
+    };
+    auto trackId = [&](TrackKind kind, int index) {
+        const Track* t = edit::trackOfKind(project.timeline(), kind, index);
+        return t ? t->id : Id{};
+    };
+    auto clipOn = [&](TrackKind kind, int index, Time at) {
+        const Track* t = edit::trackOfKind(project.timeline(), kind, index);
+        const auto placed = t ? t->clipAt(at) : std::nullopt;
+        return placed ? placed->clip->id : Id{};
+    };
+    const Time sec = oneSecond;
+    step("add V2 and A2", [](Timeline& t, const MediaPool&) {
+        return !edit::addTrack(t, TrackKind::Video).empty() && !edit::addTrack(t, TrackKind::Audio).empty();
+    });
+    edit::EditPoints points;
+    points.mediaId = media->id;
+    points.videoTrack = trackId(TrackKind::Video, 0);
+    points.audioTrack = trackId(TrackKind::Audio, 0);
+    points.playhead = sec;
+    points.sourceIn = Time(0);
+    points.sourceOut = sec + sec;
+    step("insert 2 s at 1 s (all tracks sync-locked)", [points](Timeline& t, const MediaPool& pool) {
+        return !edit::insertEdit(t, pool, points).empty();
+    });
+    check(project.timeline().duration() == beforePhase2.timeline().duration() + sec + sec, "insert made the timeline 2 s longer");
+    const Id head = clipOn(TrackKind::Video, 0, Time(0));
+    const Id inserted = clipOn(TrackKind::Video, 0, sec);
+    const Id headSound = clipOn(TrackKind::Audio, 0, Time(0));
+    step("ripple trim the first clip by -10 frames", [head, frame](Timeline& t, const MediaPool& pool) {
+        return edit::rippleTrim(t, pool, head, edit::Edge::Tail, Time(0) - Time(frame.flicks * 10));
+    });
+    step("roll its cut by +5 frames", [head, frame](Timeline& t, const MediaPool& pool) {
+        return edit::rollTrim(t, pool, head, edit::Edge::Tail, Time(frame.flicks * 5));
+    });
+    step("L cut: roll only the sound by +5 frames", [headSound, frame](Timeline& t, const MediaPool& pool) {
+        return edit::rollTrim(t, pool, headSound, edit::Edge::Tail, Time(frame.flicks * 5), false);
+    });
+    step("slip the inserted clip by +10 frames", [inserted, frame](Timeline& t, const MediaPool& pool) {
+        return edit::slipClip(t, pool, inserted, Time(frame.flicks * 10));
+    });
+    step("slide the inserted clip by +5 frames", [inserted, frame](Timeline& t, const MediaPool& pool) {
+        return edit::slideClip(t, pool, inserted, Time(frame.flicks * 5));
+    });
+    edit::EditPoints top = points;
+    top.playhead = Time(0);
+    top.sourceOut = sec;
+    step("place 1 s on top (lands on V2/A2)", [top](Timeline& t, const MediaPool& pool) {
+        return !edit::placeOnTopEdit(t, pool, top).empty();
+    });
+    check(!clipOn(TrackKind::Video, 1, Time(0)).empty(), "the clip on top is on V2");
+    edit::EditPoints fit = top;
+    fit.videoTrack = trackId(TrackKind::Video, 1);
+    fit.audioTrack = trackId(TrackKind::Audio, 1);
+    fit.recordIn = Time(sec.flicks * 4);
+    fit.recordOut = Time(sec.flicks * 6);
+    step("fit 1 s into 2 s on V2/A2 (speed 1/2)", [fit](Timeline& t, const MediaPool& pool) {
+        return !edit::fitToFillEdit(t, pool, fit).empty();
+    });
+    const Id v2 = trackId(TrackKind::Video, 1);
+    const Id a2 = trackId(TrackKind::Audio, 1);
+    step("sync lock off on V2 and A2", [v2, a2](Timeline& t, const MediaPool&) {
+        return edit::setTrackSyncLock(t, v2, false) && edit::setTrackSyncLock(t, a2, false);
+    });
+    check(!stack.edit("Ripple delete", [inserted](Timeline& t, const MediaPool&) { return edit::rippleDelete(t, {inserted}); }),
+          "ripple delete refused where it would cut the L cut");
+    const auto insertedNow = edit::trackOfKind(project.timeline(), TrackKind::Video, 0)->findClip(inserted);
+    const Id next = insertedNow ? clipOn(TrackKind::Video, 0, insertedNow->end()) : Id{};
+    step("ripple delete the clip after it (V2/A2 stay)", [next](Timeline& t, const MediaPool&) {
+        return edit::rippleDelete(t, {next});
+    });
+    dumpTimeline(project.timeline());
+
+    ExportSettings hashed = settings;
+    hashed.renderHash = true;
+    hashed.outputPath = outPath + ".phase2.mp4";
+    ExportResult plain;
+    const bool plainOk = exportWithProgress(*TimelineSnapshot::fromProject(project), hashed, &plain);
+    check(plainOk, "export the edited multitrack timeline");
+    std::vector<Id> everything;
+    for (const Track& t : project.timeline().tracks) {
+        for (const PlacedItem& p : t.clips())
+            everything.push_back(p.clip->id);
+    }
+    const auto beforeCompose = project.timelines;
+    const bool composed = stack.editProject("Compose", [everything](Project& p) {
+        return edit::composeClips(p, everything, "Everything").has_value();
+    });
+    phase2Steps += composed ? 1 : 0;
+    check(composed && project.timelines.size() == 2, "compound clip of every clip");
+    hashed.outputPath = outPath + ".compound.mp4";
+    ExportResult nested;
+    const bool nestedOk = exportWithProgress(*TimelineSnapshot::fromProject(project), hashed, &nested);
+    check(nestedOk, "export the compound clip");
+    std::printf("  render hashes  plain %016llx/%016llx  compound %016llx/%016llx\n",
+                static_cast<unsigned long long>(plain.videoHash), static_cast<unsigned long long>(plain.audioHash),
+                static_cast<unsigned long long>(nested.videoHash), static_cast<unsigned long long>(nested.audioHash));
+    check(plainOk && nestedOk && plain.framesWritten == nested.framesWritten && plain.videoHash == nested.videoHash,
+          "compound renders the same frames (hash)");
+    check(plainOk && nestedOk && plain.audioHash == nested.audioHash, "compound renders the same samples (hash)");
+    const Id compound = clipOn(TrackKind::Video, 0, Time(0));
+    const bool decomposed = stack.editProject("Decompose", [compound](Project& p) { return edit::decomposeClip(p, compound); });
+    phase2Steps += decomposed ? 1 : 0;
+    check(decomposed && project.timelines == beforeCompose, "decompose gives back the same timeline");
+    for (int i = 0; i < phase2Steps; ++i)
+        stack.undo();
+    check(project.timelines == beforePhase2.timelines, "undoing phase 2 restores the timeline");
+    QFile::remove(QString::fromStdString(outPath + ".phase2.mp4"));
+    QFile::remove(QString::fromStdString(outPath + ".compound.mp4"));
+
     std::printf("%s\n", ok ? "SELFTEST PASSED" : "SELFTEST FAILED");
     return ok ? 0 : 1;
 }
