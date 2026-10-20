@@ -23,13 +23,20 @@ plist_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 
 [ "$plist_version" = "$version" ] || { echo "Info.plist says $plist_version, CMake $version"; exit 1; }
 ls "$app/Contents/Frameworks" | grep -q '^libavcodec' || { echo "FFmpeg was not deployed into the bundle"; exit 1; }
 
+# Qt comes as a universal build: keep only this machine's architecture (about half the size).
+ditto --arch "$arch" "$app" "$app.thin"
+rm -rf "$app"
+mv "$app.thin" "$app"
+
 codesign --force --deep --sign - "$app"
 codesign --verify --deep --strict "$app"
 
 outside="$(mktemp)"
 while IFS= read -r -d '' f; do
     if file -b "$f" | grep -q 'Mach-O'; then
-        otool -L "$f" | tail -n +2 | awk '{print $1}' \
+        # Skip the headers ("<file>:", one per architecture in a universal file) and the library's own id.
+        id="$(otool -D "$f" | tail -n +2)"
+        otool -L "$f" | grep -v ':$' | awk '{print $1}' | grep -v -x -F -e "${id:-/nonexistent}" \
             | grep -v -E '^(@rpath/|@executable_path/|@loader_path/|/usr/lib/|/System/Library/)' \
             | sed "s|^|$f -> |" >>"$outside" || true
     fi

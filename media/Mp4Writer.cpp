@@ -49,7 +49,9 @@ ff::CodecContextPtr openVideoEncoderWith(const std::string& name, Rate rate, int
     }
     ctx->bit_rate = std::int64_t(bitrateKbps) * 1000;
     ctx->gop_size = std::max(1, int(std::lround(rate.toDouble() * 2.0)));
-    ctx->max_b_frames = (name == "h264_mf" || name == "libopenh264") ? 0 : 2;
+    // No B-frames where the encoder's timestamps do not survive them: Media Foundation and OpenH264
+    // have none, and VideoToolbox (its software encoder at least) hands out DTS ahead of PTS.
+    ctx->max_b_frames = (name == "h264_mf" || name == "libopenh264" || name == "h264_videotoolbox") ? 0 : 2;
     ctx->color_primaries = AVCOL_PRI_BT709;
     ctx->color_trc = AVCOL_TRC_BT709;
     ctx->colorspace = AVCOL_SPC_BT709;

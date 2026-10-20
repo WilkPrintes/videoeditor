@@ -29,9 +29,10 @@ jobs:
           xcodebuild -version
           brew install ninja
 
-      - name: Cache Qt
+      # Caches are saved right after they are made, so a later failure does not throw them away.
+      - name: Restore Qt
         id: cache-qt
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/Qt
           key: qt-${{ env.QT_VERSION }}-macos-v1
@@ -39,6 +40,13 @@ jobs:
       - name: Qt ${{ env.QT_VERSION }}
         if: steps.cache-qt.outputs.cache-hit != 'true'
         run: python3 scripts/fetch_qt.py --version "$QT_VERSION" --host mac_x64 --arch clang_64 --modules qtshadertools --extract-with tar --out "$RUNNER_TEMP/Qt"
+
+      - name: Save Qt
+        if: steps.cache-qt.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/Qt
+          key: ${{ steps.cache-qt.outputs.cache-primary-key }}
 
       - name: Deployment target
         run: |
@@ -49,9 +57,9 @@ jobs:
           echo "MACOSX_DEPLOYMENT_TARGET=${target:-13.0}" >>"$GITHUB_ENV"
           echo "deployment target ${target:-13.0}"
 
-      - name: Cache FFmpeg
+      - name: Restore FFmpeg
         id: cache-ffmpeg
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/ffmpeg
           key: ffmpeg-${{ env.FFMPEG_VERSION }}-lgpl-arm64-${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ hashFiles('scripts/build-macos-ffmpeg.sh') }}
@@ -59,6 +67,13 @@ jobs:
       - name: FFmpeg ${{ env.FFMPEG_VERSION }} (LGPL)
         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: bash scripts/build-macos-ffmpeg.sh "$RUNNER_TEMP/ffmpeg" "$FFMPEG_VERSION"
+
+      - name: Save FFmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg
+          key: ${{ steps.cache-ffmpeg.outputs.cache-primary-key }}
 
       - name: Configure
         run: >
