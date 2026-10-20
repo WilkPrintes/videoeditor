@@ -718,7 +718,8 @@ void MainWindow::buildActions()
         [this, oneSecond] { transportStep(-oneSecond()); });
     add(playback, tr("Forward One Second"), {QKeySequence(Qt::SHIFT | Qt::Key_Right)},
         [this, oneSecond] { transportStep(oneSecond()); });
-    add(playback, tr("Go to Start"), {QKeySequence(Qt::Key_Home)}, [this] { transportToStart(); });
+    add(playback, tr("Go to Start"), {QKeySequence(Qt::Key_Home)}, [this] { transportToStart(); })
+        ->setObjectName(QStringLiteral("actionGoToStart"));
     add(playback, tr("Go to End"), {QKeySequence(Qt::Key_End)}, [this] { transportToEnd(); });
 
     QMenu* view = menuBar()->addMenu(tr("&View"));

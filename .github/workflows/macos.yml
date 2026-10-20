@@ -98,7 +98,7 @@ jobs:
         continue-on-error: true
         run: |
           ./build/ve-cli encoders
-          ./build/ve-cli make-test-clip "$RUNNER_TEMP/clip.mp4" 4 640 360 30
+          ./build/ve-cli make-test-clip "$RUNNER_TEMP/clip.mp4" 8 640 360 30
           ./build/ve-cli selftest "$RUNNER_TEMP/clip.mp4" "$RUNNER_TEMP/selftest.mp4"
 
       - name: Package

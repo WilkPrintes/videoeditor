@@ -429,7 +429,9 @@ void UiTests::panelsLayoutsAndSourceViewer()
     QVERIFY(!w.isPlaying());
     action("actionPlayPause")->trigger();
     QTRY_VERIFY(!source->isPlaying());
-    QTest::keyClick(&w, Qt::Key_Home); // the source's start, the timeline stays
+    // Home: the source's start, the timeline stays. (Triggered, not typed: on macOS the native menu
+    // bar handles menu shortcuts, which synthetic key events do not reach.)
+    action("actionGoToStart")->trigger();
     QTRY_COMPARE(source->position(), Time(0));
 
     // A click in the timeline makes the timeline viewer active; Q switches back and forth.

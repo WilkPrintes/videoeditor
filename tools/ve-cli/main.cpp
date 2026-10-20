@@ -121,6 +121,11 @@ int cmdSelftest(const std::string& mediaPath, const std::string& outPath)
     if (!media)
         return 1;
     printMedia(*media);
+    // The edits below assume this much media (shorter clips leave gaps where the checks expect clips).
+    if (media->duration < timeFromSeconds(6.0)) {
+        std::fprintf(stderr, "selftest needs media of at least 6 s (try: ve-cli make-test-clip clip.mp4 8)\n");
+        return 1;
+    }
 
     Project project = makeEmptyProject();
     CommandStack stack(project);
