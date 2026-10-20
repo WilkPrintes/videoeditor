@@ -141,6 +141,38 @@ std::optional<std::size_t> nextItem(const Track& track, std::size_t index)
     return std::nullopt;
 }
 
+// The clips an edit works on: with `linked`, their linked partners too; never clips on locked tracks.
+std::vector<Id> selectionOf(const Timeline& tl, const std::vector<Id>& clipIds, bool linked)
+{
+    if (linked)
+        return expandLinked(tl, clipIds);
+    std::vector<Id> out;
+    std::set<Id> seen;
+    for (const Id& id : clipIds) {
+        const Track* owner = nullptr;
+        if (findClip(tl, id, &owner) && !owner->locked && seen.insert(id).second)
+            out.push_back(id);
+    }
+    return out;
+}
+
+// Clip-like items of the selection on unlocked tracks, for in-place changes of their fields.
+std::vector<ClipBase*> editableClips(Timeline& tl, const std::vector<Id>& clipIds)
+{
+    const std::set<Id> wanted(clipIds.begin(), clipIds.end());
+    std::vector<ClipBase*> out;
+    for (Track& t : tl.tracks) {
+        if (t.locked)
+            continue;
+        for (Item& item : t.items) {
+            ClipBase* c = clipBase(item);
+            if (c && wanted.count(c->id))
+                out.push_back(c);
+        }
+    }
+    return out;
+}
+
 // A clip an edit works on, as it was before the edit.
 struct Target {
     Id trackId;
@@ -351,6 +383,42 @@ void applySync(Timeline& tl, const ShiftPoints& points, const std::set<Id>& afte
     }
 }
 
+// Unlocked tracks with sync lock: the ones every ripple shifts.
+std::set<Id> syncLockedTracks(const Timeline& tl)
+{
+    std::set<Id> out;
+    for (const Track& t : tl.tracks) {
+        if (!t.locked && t.syncLock)
+            out.insert(t.id);
+    }
+    return out;
+}
+
+// Whether closing `ranges` (sorted, holding no clip that stays) on `tracks` moves every link group
+// by one amount, i.e. keeps the takes on those tracks in sync. `leaving` are clips being removed.
+bool groupsMoveTogether(const Timeline& tl, const std::vector<Range>& ranges, const std::set<Id>& tracks,
+                        const std::set<Id>& leaving)
+{
+    std::map<Id, Time> shift;
+    for (const Track& t : tl.tracks) {
+        if (!tracks.count(t.id))
+            continue;
+        for (const PlacedItem& p : t.clips()) {
+            if (p.clip->linkGroup.empty() || leaving.count(p.clip->id))
+                continue;
+            Time s;
+            for (const Range& r : ranges) {
+                if (r.second <= p.start)
+                    s += r.second - r.first;
+            }
+            auto [it, first] = shift.try_emplace(p.clip->linkGroup, s);
+            if (!first && it->second != s)
+                return false;
+        }
+    }
+    return true;
+}
+
 // The part [from, to) of the track, moved to start at zero.
 Track cropped(const Track& track, Time from, Time to)
 {
@@ -517,11 +585,11 @@ std::vector<Id> placeMedia(Timeline& tl, const MediaItem& media, std::optional<T
     return placeNewClips(tl, media, tracks, Time(0), start, length);
 }
 
-bool splitAt(Timeline& tl, Time t, const std::vector<Id>& only)
+bool splitAt(Timeline& tl, Time t, const std::vector<Id>& only, bool linked)
 {
     std::set<Id> allowed;
     if (!only.empty()) {
-        for (Id& id : expandLinked(tl, only))
+        for (Id& id : selectionOf(tl, only, linked))
             allowed.insert(std::move(id));
     }
     IdRemap links;
@@ -539,7 +607,7 @@ bool splitAt(Timeline& tl, Time t, const std::vector<Id>& only)
     return any;
 }
 
-bool moveClips(Timeline& tl, const std::vector<Id>& clipIds, Time delta, int trackShift)
+bool moveClips(Timeline& tl, const std::vector<Id>& clipIds, Time delta, int trackShift, bool linked)
 {
     struct Moving {
         Id trackId;
@@ -549,7 +617,7 @@ bool moveClips(Timeline& tl, const std::vector<Id>& clipIds, Time delta, int tra
         Time start;
     };
     std::vector<Moving> moving;
-    for (const Id& id : expandLinked(tl, clipIds)) {
+    for (const Id& id : selectionOf(tl, clipIds, linked)) {
         if (auto loc = tl.locateClip(id))
             moving.push_back({loc->track->id, loc->track->kind, kindIndex(tl, loc->track->id), loc->item, loc->start});
     }
@@ -626,17 +694,183 @@ bool trimClip(Timeline& tl, const MediaPool& pool, const Id& clipId, Edge edge, 
     return true;
 }
 
-bool deleteClips(Timeline& tl, const std::vector<Id>& clipIds)
+bool deleteClips(Timeline& tl, const std::vector<Id>& clipIds, bool linked)
 {
     IdRemap links;
     bool any = false;
-    for (const Id& id : expandLinked(tl, clipIds)) {
+    for (const Id& id : selectionOf(tl, clipIds, linked)) {
         if (auto loc = tl.locateClip(id)) {
             loc->track->liftRange(loc->start, loc->end(), links);
             any = true;
         }
     }
     return any;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Organization
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// Clears the group of members left alone in it (a group of one links nothing).
+void dropLonelyGroups(Timeline& tl, const std::set<Id>& groups)
+{
+    std::map<Id, int> members;
+    for (const Track& t : tl.tracks) {
+        for (const Item& item : t.items) {
+            const ClipBase* c = clipBase(item);
+            if (c && groups.count(c->linkGroup))
+                ++members[c->linkGroup];
+        }
+    }
+    for (Track& t : tl.tracks) {
+        if (t.locked)
+            continue;
+        for (Item& item : t.items) {
+            ClipBase* c = clipBase(item);
+            if (c && groups.count(c->linkGroup) && members[c->linkGroup] == 1)
+                c->linkGroup.clear();
+        }
+    }
+}
+
+} // namespace
+
+bool renameClip(Timeline& tl, const Id& clipId, const std::string& name)
+{
+    const auto clips = editableClips(tl, {clipId});
+    if (clips.empty() || clips.front()->name == name)
+        return false;
+    clips.front()->name = name;
+    return true;
+}
+
+bool setClipColor(Timeline& tl, const std::vector<Id>& clipIds, const std::string& color)
+{
+    bool any = false;
+    for (ClipBase* c : editableClips(tl, clipIds)) {
+        if (c->color != color) {
+            c->color = color;
+            any = true;
+        }
+    }
+    return any;
+}
+
+bool setClipFlag(Timeline& tl, const std::vector<Id>& clipIds, const std::string& color, bool on)
+{
+    if (color.empty())
+        return false;
+    bool any = false;
+    for (ClipBase* c : editableClips(tl, clipIds)) {
+        auto it = std::lower_bound(c->flags.begin(), c->flags.end(), color);
+        const bool has = it != c->flags.end() && *it == color;
+        if (on && !has) {
+            c->flags.insert(it, color);
+            any = true;
+        } else if (!on && has) {
+            c->flags.erase(it);
+            any = true;
+        }
+    }
+    return any;
+}
+
+bool clearClipFlags(Timeline& tl, const std::vector<Id>& clipIds)
+{
+    bool any = false;
+    for (ClipBase* c : editableClips(tl, clipIds)) {
+        if (!c->flags.empty()) {
+            c->flags.clear();
+            any = true;
+        }
+    }
+    return any;
+}
+
+bool setClipsEnabled(Timeline& tl, const std::vector<Id>& clipIds, bool enabled)
+{
+    bool any = false;
+    for (ClipBase* c : editableClips(tl, clipIds)) {
+        if (c->enabled != enabled) {
+            c->enabled = enabled;
+            any = true;
+        }
+    }
+    return any;
+}
+
+bool renameTrack(Timeline& tl, const Id& trackId, const std::string& name)
+{
+    Track* t = tl.track(trackId);
+    if (!t || name.empty() || t->name == name)
+        return false;
+    for (const Track& other : tl.tracks) {
+        if (other.id != trackId && other.name == name)
+            return false;
+    }
+    t->name = name;
+    return true;
+}
+
+bool setTrackColor(Timeline& tl, const Id& trackId, const std::string& color)
+{
+    Track* t = tl.track(trackId);
+    if (!t || t->color == color)
+        return false;
+    t->color = color;
+    return true;
+}
+
+bool setTrackEnabled(Timeline& tl, const Id& trackId, bool enabled)
+{
+    Track* t = tl.track(trackId);
+    if (!t || t->enabled == enabled)
+        return false;
+    t->enabled = enabled;
+    return true;
+}
+
+bool linkClips(Timeline& tl, const std::vector<Id>& clipIds)
+{
+    const std::set<Id> wanted(clipIds.begin(), clipIds.end());
+    const auto clips = editableClips(tl, clipIds);
+    if (clips.size() < 2 || clips.size() != wanted.size())
+        return false; // a clip is missing or on a locked track
+    std::set<Id> tracks;
+    std::set<Id> oldGroups;
+    for (const Track& t : tl.tracks) {
+        for (const PlacedItem& p : t.clips()) {
+            if (!wanted.count(p.clip->id))
+                continue;
+            if (!tracks.insert(t.id).second)
+                return false; // two clips of one track cannot be one take
+            oldGroups.insert(p.clip->linkGroup);
+        }
+    }
+    // Already exactly one group made of these clips: nothing to do.
+    if (oldGroups.size() == 1 && !oldGroups.begin()->empty() && linkedGroup(tl, clipIds.front()).size() == wanted.size())
+        return false;
+    const Id group = newId();
+    for (ClipBase* c : clips)
+        c->linkGroup = group;
+    oldGroups.erase(Id{});
+    dropLonelyGroups(tl, oldGroups);
+    return true;
+}
+
+bool unlinkClips(Timeline& tl, const std::vector<Id>& clipIds)
+{
+    std::set<Id> groups;
+    for (ClipBase* c : editableClips(tl, clipIds)) {
+        if (!c->linkGroup.empty()) {
+            groups.insert(c->linkGroup);
+            c->linkGroup.clear();
+        }
+    }
+    dropLonelyGroups(tl, groups);
+    return !groups.empty();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -820,6 +1054,49 @@ std::vector<Id> placeOnTopEdit(Timeline& tl, const MediaPool& pool, const EditPo
     if (trackIds.empty())
         return {};
     return placeNewClips(tl, *media, trackIds, r->sourceStart, r->recordStart, r->duration);
+}
+
+std::vector<Id> appendEdit(Timeline& tl, const MediaPool& pool, const EditPoints& points)
+{
+    const MediaItem* media = pool.find(points.mediaId);
+    if (!media)
+        return {};
+    const auto dest = destinationTracks(tl, *media, points);
+    if (!dest)
+        return {};
+    Time end;
+    for (const Id& id : *dest)
+        end = std::max(end, tl.track(id)->duration());
+    EditPoints p = points;
+    p.recordIn = end;
+    p.recordOut.reset();
+    return overwriteEdit(tl, pool, p);
+}
+
+std::vector<Id> rippleOverwriteEdit(Timeline& tl, const MediaPool& pool, const EditPoints& points)
+{
+    const MediaItem* media = pool.find(points.mediaId);
+    if (!media)
+        return {};
+    const auto dest = destinationTracks(tl, *media, points);
+    if (!dest)
+        return {};
+    const Time at = gridPoint(points.recordIn.value_or(points.playhead), tl.rate);
+    const auto replaced = tl.track(dest->front())->clipAt(at);
+    if (!replaced)
+        return {};
+    const Time start = replaced->start;
+    const Id replacedId = replaced->clip->id;
+    const Timeline before = tl; // the two steps are one edit: undo the first if the second fails
+    if (!rippleDelete(tl, {replacedId}))
+        return {};
+    EditPoints p = points;
+    p.recordIn = start;
+    p.recordOut.reset();
+    std::vector<Id> ids = insertEdit(tl, pool, p);
+    if (ids.empty())
+        tl = before;
+    return ids;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1032,9 +1309,9 @@ bool slideClip(Timeline& tl, const MediaPool& pool, const Id& clipId, Time delta
     return true;
 }
 
-bool rippleDelete(Timeline& tl, const std::vector<Id>& clipIds)
+bool rippleDelete(Timeline& tl, const std::vector<Id>& clipIds, bool linked)
 {
-    const std::vector<Id> ids = expandLinked(tl, clipIds);
+    const std::vector<Id> ids = selectionOf(tl, clipIds, linked);
     if (ids.empty())
         return false;
     const std::set<Id> selected(ids.begin(), ids.end());
@@ -1071,29 +1348,172 @@ bool rippleDelete(Timeline& tl, const std::vector<Id>& clipIds)
     }
     // Linked clips that stay must move by the same amount on the sync-locked tracks, or a hole
     // closing between the picture and the sound of a take would put them out of sync.
-    std::map<Id, Time> groupShift;
-    for (const Track& t : tl.tracks) {
-        if (t.locked || !t.syncLock)
-            continue;
-        for (const PlacedItem& p : t.clips()) {
-            if (p.clip->linkGroup.empty() || selected.count(p.clip->id))
-                continue;
-            Time shift;
-            for (const Range& r : everywhere) {
-                if (r.second <= p.start)
-                    shift += r.second - r.first;
-            }
-            auto [it, first] = groupShift.try_emplace(p.clip->linkGroup, shift);
-            if (!first && it->second != shift)
-                return false;
-        }
-    }
+    if (!groupsMoveTogether(tl, everywhere, syncLockedTracks(tl), selected))
+        return false;
 
     IdRemap links;
     for (const auto& [trackId, ranges] : plan) {
         Track& track = *tl.track(trackId);
         for (auto r = ranges.rbegin(); r != ranges.rend(); ++r) // from the end: earlier ranges stay put
             track.removeRange(r->first, r->second, links);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gaps and order
+// ---------------------------------------------------------------------------------------------
+
+bool insertGap(Timeline& tl, Time at, Time length)
+{
+    at = gridPoint(at, tl.rate);
+    length = floorToFrame(std::max(length, Time(0)), tl.rate);
+    if (length <= Time(0))
+        return false;
+    ShiftPoints shifted;
+    for (const Track& t : tl.tracks) {
+        if (!t.locked && t.syncLock && at < t.duration())
+            shifted[t.id] = at;
+    }
+    if (shifted.empty())
+        return false;
+    const auto sync = planSync(tl, shifted, {});
+    if (!sync)
+        return false;
+    IdRemap links;
+    for (const auto& [trackId, point] : shifted)
+        tl.track(trackId)->insertSpace(point, length, links);
+    applySync(tl, shifted, *sync, links);
+    return true;
+}
+
+bool deleteGap(Timeline& tl, const Id& trackId, Time at)
+{
+    const Track* track = tl.track(trackId);
+    if (!track || track->locked)
+        return false;
+    std::optional<Range> gap;
+    Time pos;
+    for (const Item& item : track->items) {
+        const Time d = durationOf(item);
+        if (std::holds_alternative<Gap>(item) && pos <= at && at < pos + d)
+            gap = Range{pos, pos + d};
+        pos += d;
+    }
+    if (!gap)
+        return false;
+    std::set<Id> affected{trackId};
+    if (track->syncLock) {
+        for (const Track& t : tl.tracks) {
+            if (t.locked || !t.syncLock || t.id == trackId)
+                continue;
+            if (hasClipIn(t, gap->first, gap->second))
+                return false; // that track would lose sync
+            affected.insert(t.id);
+        }
+    }
+    if (!groupsMoveTogether(tl, {*gap}, affected, {}))
+        return false;
+    IdRemap links;
+    for (const Id& id : affected)
+        tl.track(id)->removeRange(gap->first, gap->second, links);
+    return true;
+}
+
+bool deleteGaps(Timeline& tl)
+{
+    const std::set<Id> affected = syncLockedTracks(tl);
+    std::vector<Range> busy;
+    for (const Track& t : tl.tracks) {
+        if (!affected.count(t.id))
+            continue;
+        for (const PlacedItem& p : t.clips())
+            busy.push_back({p.start, p.end()});
+    }
+    std::vector<Range> gaps;
+    Time pos;
+    for (const Range& r : mergeRanges(busy)) {
+        if (r.first > pos)
+            gaps.push_back({pos, r.first});
+        pos = std::max(pos, r.second);
+    }
+    if (gaps.empty() || !groupsMoveTogether(tl, gaps, affected, {}))
+        return false;
+    IdRemap links;
+    for (const Id& id : affected) {
+        Track& track = *tl.track(id);
+        for (auto r = gaps.rbegin(); r != gaps.rend(); ++r)
+            track.removeRange(r->first, r->second, links);
+    }
+    return true;
+}
+
+bool swapClips(Timeline& tl, const Id& clipId, int direction)
+{
+    if (direction == 0)
+        return false;
+    const std::vector<Target> targets = targetsFor(tl, clipId, true);
+    if (targets.empty())
+        return false;
+
+    struct Swap {
+        Id trackId;
+        std::size_t self;     // index of the clip
+        std::size_t other;    // index of the neighbour clip
+        Time selfShift;       // how far each one moves
+        Time otherShift;
+    };
+    std::vector<Swap> swaps;
+    Id neighbourGroup;
+    std::set<Id> neighbours;
+    for (const Target& t : targets) {
+        const Track& track = *tl.track(t.trackId);
+        std::optional<std::size_t> other;
+        for (std::size_t i = t.index; direction > 0 ? i + 1 < track.items.size() : i > 0;) {
+            i = direction > 0 ? i + 1 : i - 1;
+            if (clipBase(track.items[i])) {
+                other = i;
+                break;
+            }
+        }
+        if (!other)
+            return false;
+        const ClipBase* n = clipBase(track.items[*other]);
+        if (&t == &targets.front())
+            neighbourGroup = n->linkGroup;
+        else if (neighbourGroup.empty() || n->linkGroup != neighbourGroup)
+            return false; // a partner would swap with something unrelated
+        neighbours.insert(n->id);
+        // Positions: the clip, what lies between, and the neighbour exchange places in that span.
+        const auto self = track.findClip(clipBase(t.item)->id);
+        const auto placed = track.findClip(n->id);
+        Swap s{t.trackId, t.index, *other, Time(0), Time(0)};
+        if (direction > 0) {
+            s.selfShift = placed->end() - self->end();
+            s.otherShift = Time(0) - (placed->start - self->start);
+        } else {
+            s.selfShift = Time(0) - (self->start - placed->start);
+            s.otherShift = self->end() - placed->end();
+        }
+        swaps.push_back(s);
+    }
+    // The neighbour's own partners must all be among the swapped neighbours, and each take must
+    // move by one amount on every track.
+    if (!neighbourGroup.empty()) {
+        for (const Id& id : linkedGroup(tl, *neighbours.begin())) {
+            if (!neighbours.count(id))
+                return false;
+        }
+    }
+    for (const Swap& s : swaps) {
+        if (s.selfShift != swaps.front().selfShift || s.otherShift != swaps.front().otherShift)
+            return false;
+    }
+
+    for (const Swap& s : swaps) {
+        Track& track = *tl.track(s.trackId);
+        std::swap(track.items[s.self], track.items[s.other]);
+        track.normalize(); // transitions that no longer sit between their clips go away
     }
     return true;
 }
@@ -1298,6 +1718,89 @@ bool decomposeClip(Project& project, const Id& compoundClipId)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Timelines of the project
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+bool timelineNameTaken(const Project& project, const std::string& name, const Id& except = {})
+{
+    return std::any_of(project.timelines.begin(), project.timelines.end(),
+                       [&](const Timeline& t) { return t.id != except && t.name == name; });
+}
+
+std::string uniqueTimelineName(const Project& project, const std::string& wanted)
+{
+    if (!timelineNameTaken(project, wanted))
+        return wanted;
+    for (int n = 2;; ++n) {
+        const std::string candidate = wanted + " " + std::to_string(n);
+        if (!timelineNameTaken(project, candidate))
+            return candidate;
+    }
+}
+
+} // namespace
+
+Id newTimeline(Project& project, std::string name)
+{
+    const Timeline& current = project.timeline();
+    Timeline tl = makeDefaultTimeline();
+    tl.rate = current.rate;
+    tl.width = current.width;
+    tl.height = current.height;
+    tl.sampleRate = current.sampleRate;
+    tl.name = uniqueTimelineName(project, name.empty() ? "Timeline " + std::to_string(project.timelines.size() + 1) : name);
+    const Id id = tl.id;
+    project.timelines.push_back(std::move(tl));
+    project.currentTimeline = id;
+    return id;
+}
+
+Id duplicateTimeline(Project& project, const Id& timelineId, std::string name)
+{
+    const Timeline* source = project.findTimeline(timelineId);
+    if (!source)
+        return {};
+    Timeline copy = *source;
+    copy.id = newId();
+    copy.name = uniqueTimelineName(project, name.empty() ? source->name + " copy" : name);
+    const Id id = copy.id;
+    project.timelines.push_back(std::move(copy)); // `source` is invalid from here on
+    project.currentTimeline = id;
+    return id;
+}
+
+bool setCurrentTimeline(Project& project, const Id& timelineId)
+{
+    if (!project.findTimeline(timelineId) || project.currentTimeline == timelineId)
+        return false;
+    project.currentTimeline = timelineId;
+    return true;
+}
+
+bool renameTimeline(Project& project, const Id& timelineId, const std::string& name)
+{
+    Timeline* tl = project.findTimeline(timelineId);
+    if (!tl || name.empty() || tl->name == name || timelineNameTaken(project, name, timelineId))
+        return false;
+    tl->name = name;
+    return true;
+}
+
+bool deleteTimeline(Project& project, const Id& timelineId)
+{
+    if (project.timelines.size() <= 1 || !project.findTimeline(timelineId) || countReferences(project, timelineId, {}) > 0)
+        return false;
+    auto& timelines = project.timelines;
+    timelines.erase(std::remove_if(timelines.begin(), timelines.end(), [&](const Timeline& t) { return t.id == timelineId; }),
+                    timelines.end());
+    if (project.currentTimeline == timelineId)
+        project.currentTimeline = timelines.front().id;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Markers
 // ---------------------------------------------------------------------------------------------
 
@@ -1353,6 +1856,27 @@ bool removeMarker(Timeline& tl, const Id& markerId)
     if (it == tl.markers.end())
         return false;
     tl.markers.erase(it);
+    return true;
+}
+
+bool updateMarker(Timeline& tl, const Marker& marker)
+{
+    auto it = std::find_if(tl.markers.begin(), tl.markers.end(), [&](const Marker& m) { return m.id == marker.id; });
+    if (it == tl.markers.end())
+        return false;
+    Marker m = marker;
+    m.start = gridPoint(m.start, tl.rate);
+    m.duration = m.duration > Time(0) ? floorToFrame(m.duration, tl.rate) : Time(0);
+    if (m.color.empty())
+        m.color = "blue";
+    if (*it == m)
+        return false;
+    for (const Marker& other : tl.markers) {
+        if (other.id != m.id && other.start == m.start)
+            return false; // one marker per frame
+    }
+    tl.markers.erase(it);
+    insertSorted(tl.markers, std::move(m));
     return true;
 }
 

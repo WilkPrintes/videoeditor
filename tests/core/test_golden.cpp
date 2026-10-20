@@ -101,7 +101,7 @@ void checkGolden(const std::string& name, const std::string& description, const 
 
 // Builds the fixture, lets `setup` adjust it (locks, earlier edits), applies `op` and compares.
 void golden(const std::string& name, const std::string& description, const std::function<void(MultiFixture&)>& setup,
-            const std::function<bool(MultiFixture&)>& op)
+            const std::function<bool(MultiFixture&)>& op, bool inSync = true)
 {
     MultiFixture f;
     if (setup)
@@ -111,7 +111,7 @@ void golden(const std::string& name, const std::string& description, const std::
     INFO(name);
     for (const Timeline& tl : f.project.timelines) {
         CHECK(edit::checkInvariants(tl, f.pool()).empty());
-        CHECK(edit::checkSync(tl).empty());
+        CHECK(edit::checkSync(tl).empty() == inSync);
     }
     if (!applied)
         CHECK(f.project == before); // refused edits change nothing
@@ -205,6 +205,38 @@ TEST_CASE("golden states: trims", "[golden][trim]")
            [clip](MultiFixture& f) { return edit::rippleDelete(f.tl(), {clip(f, "V1", 200)}); });
     golden("ripple_delete_blocked", "Ripple delete Y with every track sync-locked: the title and the music are in the hole, refused.",
            nullptr, [clip](MultiFixture& f) { return edit::rippleDelete(f.tl(), {clip(f, "V1", 200)}); });
+}
+
+TEST_CASE("golden states: phase 3 edits and organization", "[golden][phase3]")
+{
+    golden("append", "Append b [0,60) after the end of V1/A1; the playhead and the timeline In are ignored.", nullptr,
+           [](MultiFixture& f) {
+               edit::EditPoints p = marked(f, f.b, 30, {}, 60);
+               p.recordIn = F(10);
+               return !edit::appendEdit(f.tl(), f.pool(), p).empty();
+           });
+    golden("ripple_overwrite", "Ripple overwrite of Y (under frame 200) with b [0,60): Z moves up 140 frames. V2 locked, A2 without sync lock.",
+           lockV2SyncOffA2,
+           [](MultiFixture& f) { return !edit::rippleOverwriteEdit(f.tl(), f.pool(), marked(f, f.b, 200, {}, 60)).empty(); });
+    golden("insert_gap", "Insert a 30-frame gap at frame 50: X is cut, everything after moves; A2 has sync lock off.", syncOffA2,
+           [](MultiFixture& f) { return edit::insertGap(f.tl(), F(50), F(30)); });
+    golden("delete_gaps", "Lift X, then delete gaps: the empty [0,100) closes on V1, A1 and V2; A2 has sync lock off.", syncOffA2,
+           [](MultiFixture& f) {
+               edit::deleteClips(f.tl(), {f.clipAt("V1", 50)});
+               return edit::deleteGaps(f.tl());
+           });
+    golden("swap_clips", "Swap Y with Z (to the right), picture and sound together.", nullptr,
+           [](MultiFixture& f) { return edit::swapClips(f.tl(), f.clipAt("V1", 200), 1); });
+    golden("labels", "Colour X orange, flag it red and green, rename V2 and colour it purple.", nullptr, [](MultiFixture& f) {
+        const Id x = f.clipAt("V1", 50);
+        const Id v2 = f.track("V2").id;
+        return edit::setClipColor(f.tl(), {x, f.clipAt("A1", 50)}, "orange") && edit::setClipFlag(f.tl(), {x}, "red", true)
+            && edit::setClipFlag(f.tl(), {x}, "green", true) && edit::renameTrack(f.tl(), v2, "Titles")
+            && edit::setTrackColor(f.tl(), v2, "purple");
+    });
+    golden("unlinked_move", "With linked selection off, move only the picture of Y 10 frames later: its sound stays (out of sync on purpose).",
+           nullptr, [](MultiFixture& f) { return edit::moveClips(f.tl(), {f.clipAt("V1", 200)}, F(10), 0, false); },
+           false);
 }
 
 TEST_CASE("golden states: multitrack and compound clips", "[golden][compound]")

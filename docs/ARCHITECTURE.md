@@ -22,7 +22,7 @@
   exportação), reaproveitáveis num render headless ou num processo separado.
 - **ui** só lê o modelo e emite *pedidos* (mover, trim, cortar...). A `MainWindow` transforma
   cada pedido em Command. Nenhum widget altera o modelo diretamente.
-- `color/`, `fx/` e `analysis/` estão reservadas para as fases 3, 4 e 7.
+- `fx/`, `color/` e `analysis/` estão reservadas para as fases 4, 5 e 9.
 
 ## Tempo (spec §5.1)
 
@@ -41,7 +41,7 @@
 Project ─ MediaPool ─ Folder* ─ MediaItem (arquivo, streams, timecode, taxa, metadados, proxy)
         └ Timeline* ─ Track* (Video | Audio, lock, sync lock) ─ Item*
                     └ Marker* (início, duração, nome, nota, cor)
-Item = Clip(mediaId, sourceRange, enabled, linkGroup, effects[], grade, retime)
+Item = Clip(mediaId, sourceRange, enabled, linkGroup, color, flags[], effects[], grade, retime)
      | Gap | Transition(in/out, alinhamento) | CompoundClip(timelineId) | MulticamClip(angles[], activeAngle)
 ```
 
@@ -54,7 +54,7 @@ Item = Clip(mediaId, sourceRange, enabled, linkGroup, effects[], grade, retime)
   ocupa na timeline. Um `Retime` (velocidade constante num/den) funciona como o `LinearTimeWarp` do
   OTIO: o clipe lê `sourceOffset(item, t)` de mídia em `t` de timeline. Toda conta de mídia (fatiar,
   handles, slip, render) passa por `sourceOffset`, `clipTimeFor` e `sourceEnd`.
-- `AnimatedParam` é um valor fixo ou uma curva de keyframes (linear e hold; Bézier na fase 3).
+- `AnimatedParam` é um valor fixo ou uma curva de keyframes (linear e hold; Bézier na fase 4).
 - **Clipes ligados:** vídeo e áudio importados juntos compartilham um `linkGroup` e editam juntos.
   Quando uma edição parte clipes em várias trilhas ao mesmo tempo, `IdRemap` dá às metades novas
   um grupo novo, igual entre as trilhas.
@@ -190,13 +190,60 @@ Os marcadores são da timeline, ordenados e um por frame. Ripples não os movem.
   `ScopedIdSequence`, que dá ids determinísticos. Para cada operação, grava o antes e o depois
   (`timelineToJson`) em `tests/core/golden/<nome>.json`, com um resumo em frames para revisão.
   `VE_UPDATE_GOLDEN=1` regrava os arquivos.
-- **Propriedade:** `tests/core/test_property.cpp` roda 2 × 20 000 edições aleatórias de todos os
-  tipos pelo `CommandStack`:
+- **Propriedade:** `tests/core/test_property.cpp` roda 2 × 22 500 edições aleatórias (cinco
+  sementes de 4 500) de todos os tipos pelo `CommandStack`, inclusive as da fase 3:
   - uma rodada só com edições ligadas, que exige alinhamento V/A estrito;
   - outra com J/L, mídia de um tipo só e travas.
 
   A cada passo valem `checkInvariants`, `checkSync`, trilhas travadas intactas e, no fim, o undo
   total.
+
+## Fase 3: organização, edições novas e a janela
+
+### Organização e edições novas (core)
+
+- Clipes têm `color` e `flags` (ordenadas, sem repetição); trilhas têm `color`. Nomes de trilha e de
+  timeline são únicos. O JSON só grava esses campos quando diferem do padrão, então projetos e
+  dourados anteriores continuam idênticos byte a byte.
+- `linkClips` junta clipes (um por trilha) num grupo novo; `unlinkClips` tira do grupo e desfaz o
+  grupo que ficar com um clipe só. Um link fora de sincronia continua editando junto e aparece em
+  `outOfSyncClips`.
+- **Linked selection desligado:** `splitAt`, `moveClips`, `deleteClips` e `rippleDelete` recebem
+  `linked = false` e editam só os clipes pedidos, como no Resolve. Os trims já tinham o Alt.
+- `appendEdit` vai depois do último item das trilhas de destino. `rippleOverwriteEdit` é um ripple
+  delete do clipe sob o ponto seguido de um insert, atômico (trabalha numa cópia) e com as mesmas
+  regras de sync lock.
+- `insertGap` abre tempo vazio em todas as trilhas com sync lock; `deleteGap` fecha um gap (nas
+  outras trilhas com sync lock o trecho precisa estar vazio); `deleteGaps` fecha todo trecho vazio
+  em todas elas. `swapClips` troca um clipe (e os ligados) com o vizinho; os ligados precisam trocar
+  com os ligados do vizinho, para a sincronia não quebrar.
+- Várias timelines: `newTimeline`, `duplicateTimeline`, `renameTimeline`, `deleteTimeline` (recusado
+  para a última e para uma que um composto mostra) e `setCurrentTimeline`.
+- Testes: 7 dourados novos (29 no total; os 22 da fase 2 não mudaram), casos em
+  `test_organization.cpp` e `test_gaps_and_order.cpp` e as edições novas no teste de propriedade.
+
+### A janela (ui)
+
+- O widget central é o viewer da timeline. Media pool e edit index (em abas), viewer de fonte,
+  inspector e timeline são `QDockWidget`s. A timeline ocupa a largura toda (`setCorner`). Cada dock
+  tem `objectName`, então `saveState`/`restoreState` guardam o layout: os presets ficam em
+  `layouts.ini` (`QSettings`, formato ini, em `AppConfigLocation`). O último layout é gravado ao
+  fechar e restaurado só pelo `app/main.cpp`; os testes ligam o modo de teste do `QStandardPaths` e
+  começam do layout padrão.
+- **Dois viewers, um ativo.** O viewer de fonte (`SourceViewerPanel`) tem seu próprio
+  `PlaybackEngine`, sobre um snapshot de um clipe só com a mídia na grade de frames da timeline. Um
+  clique num viewer ou na timeline escolhe o ativo, e Q alterna. Transporte, Home/End, setas e I/O
+  vão para o ativo, e tocar um pausa o outro. As edições de 3 e 4 pontos usam a mídia do viewer de
+  fonte com o In/Out dela; com o viewer vazio, a mídia selecionada no pool, inteira.
+- Os painéis nunca editam o modelo. `InspectorWidget` e `EditIndexWidget` emitem sinais, e a
+  `MainWindow` transforma cada um num comando (`TimelineEditCommand` ou `ProjectEditCommand`). Os
+  menus de contexto saem de `MainWindow::contextMenu(TimelineWidget::Context)`, separado do `exec`
+  para os testes acionarem as ações.
+- Abas de timeline: uma por timeline do projeto, compostos incluídos. Trocar de aba não é uma
+  edição (cada comando lembra o id da sua timeline, então o desfazer continua certo), e cada
+  timeline guarda o próprio playhead.
+- O `QWidget` apaga os filhos depois dos membros; por isso o destrutor da `MainWindow` desconecta
+  os sinais dos painéis antes.
 
 ## Persistência
 
@@ -275,7 +322,8 @@ O mapa completo está no §14 da [especificação](ESPECIFICACAO.md).
 | Resolve | Aqui |
 |---|---|
 | UI em Qt Widgets + toolkit desenhado na GPU | Qt Widgets + `QRhiWidget` |
-| Páginas como bibliotecas carregadas sob demanda | ainda não: janela única (próximo passo) |
+| Páginas como bibliotecas carregadas sob demanda | ainda não: janela única com a página Edit; barra de páginas na fase 7 |
+| `UiPanelLayoutBase` (painéis e layouts por página) | `QDockWidget`s com presets de layout em `QSettings` |
 | Modelo Sm2Timeline/Track/Clip/Gap/Transition/Compound/Multicam em protobuf num banco SQLite/PostgreSQL | modelo OTIO-like (com compostos e multicam) em JSON com flicks; SQLite é o próximo passo |
 | Ações *Act com undo e CreateTransaction/Commit/Abort | `Command` + `CommandStack` com transações e fusão de gestos |
 | Modo de trim (ripple/roll/slip/slide), edições F9–F12, sync lock e travas de trilha | `core/Edit.h` com as mesmas edições; ferramentas e modificadores na timeline |

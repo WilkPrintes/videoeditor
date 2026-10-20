@@ -155,7 +155,7 @@ private:
         const bool linked = !m_asymmetric || chance(50);
         int op = pick(0, 99);
         if (clipCount() > 160 && chance(30))
-            op = 76; // keep the timeline dense and bounded: lift a clip
+            op = 79; // keep the timeline dense and bounded: lift a clip
 
         if (op < 3 || clip.empty()) {
             const Time at = frame(0, 900);
@@ -163,7 +163,7 @@ private:
         }
         if (op < 13) {
             const edit::EditPoints p = randomPoints(m);
-            switch (pick(0, 4)) {
+            switch (pick(0, 6)) {
             case 0:
                 return {"insert", edit("Insert", [p](Timeline& t, const MediaPool& mp) { return !edit::insertEdit(t, mp, p).empty(); })};
             case 1:
@@ -175,21 +175,55 @@ private:
             case 3:
                 return {"fit to fill",
                         edit("Fit", [p](Timeline& t, const MediaPool& mp) { return !edit::fitToFillEdit(t, mp, p).empty(); })};
-            default:
+            case 4:
                 return {"place on top",
                         edit("Top", [p](Timeline& t, const MediaPool& mp) { return !edit::placeOnTopEdit(t, mp, p).empty(); })};
+            case 5:
+                return {"append",
+                        edit("Append", [p](Timeline& t, const MediaPool& mp) { return !edit::appendEdit(t, mp, p).empty(); })};
+            default: {
+                // Aim at an existing clip: its track (and the matching one of the other kind) is the destination.
+                edit::EditPoints aimed = p;
+                aimed.recordIn.reset();
+                aimed.recordOut.reset();
+                if (auto loc = tl().locateClip(clip)) {
+                    aimed.playhead = loc->start;
+                    const int k = edit::kindIndex(tl(), loc->track->id);
+                    const Track* video = edit::trackOfKind(tl(), TrackKind::Video, k);
+                    const Track* audio = edit::trackOfKind(tl(), TrackKind::Audio, k);
+                    if (loc->track->kind == TrackKind::Video) {
+                        aimed.videoTrack = loc->track->id;
+                        aimed.audioTrack = audio && !m_asymmetric ? audio->id : p.audioTrack;
+                    } else {
+                        aimed.audioTrack = loc->track->id;
+                        aimed.videoTrack = video && !m_asymmetric ? video->id : Id{};
+                    }
+                }
+                return {"ripple overwrite", edit("Ripple overwrite", [aimed](Timeline& t, const MediaPool& mp) {
+                            return !edit::rippleOverwriteEdit(t, mp, aimed).empty();
+                        })};
+            }
             }
         }
         if (op < 17) {
             const Time t0 = frame(0, 900);
+            if (chance(50)) // only this clip, with or without its partners
+                return {"split", edit("Split", [t0, clip, linked](Timeline& t, const MediaPool&) {
+                            return edit::splitAt(t, t0, {clip}, linked);
+                        })};
             return {"split", edit("Split", [t0](Timeline& t, const MediaPool&) { return edit::splitAt(t, t0); })};
         }
         if (op < 22) {
             const Time delta = frame(-120, 120);
             const int shift = pick(-1, 1);
-            return {"move", edit("Move", [clip, delta, shift](Timeline& t, const MediaPool&) {
-                        return edit::moveClips(t, {clip}, delta, shift);
-                    })};
+            // Moving a picture without its sound puts the take out of sync: only once that may happen.
+            const bool together = !m_mayLock || chance(50);
+            Op result{"move", edit("Move", [clip, delta, shift, together](Timeline& t, const MediaPool&) {
+                          return edit::moveClips(t, {clip}, delta, shift, together);
+                      })};
+            if (!together)
+                m_syncGuaranteed = false;
+            return result;
         }
         const auto edge = chance(50) ? edit::Edge::Head : edit::Edge::Tail;
         if (op < 28) {
@@ -204,30 +238,80 @@ private:
                         return edit::rippleTrim(t, mp, clip, edge, delta, linked);
                     }), true, true};
         }
-        if (op < 59) {
+        if (op < 58) {
             const Time delta = frame(-90, 90);
             return {"roll", edit("Roll", [clip, edge, delta, linked](Timeline& t, const MediaPool& mp) {
                         return edit::rollTrim(t, mp, clip, edge, delta, linked);
                     }), true, true};
         }
-        if (op < 67) {
+        if (op < 65) {
             const Time delta = frame(-90, 90);
             return {"slip", edit("Slip", [clip, delta](Timeline& t, const MediaPool& mp) {
                         return edit::slipClip(t, mp, clip, delta);
                     }), true, true};
         }
-        if (op < 75) {
+        if (op < 72) {
             const Time delta = frame(-90, 90);
             return {"slide", edit("Slide", [clip, delta](Timeline& t, const MediaPool& mp) {
                         return edit::slideClip(t, mp, clip, delta);
                     }), true, true};
         }
-        if (op < 78)
-            return {"delete", edit("Delete", [clip](Timeline& t, const MediaPool&) { return edit::deleteClips(t, {clip}); })};
-        if (op < 83)
-            return {"ripple delete",
-                    edit("Ripple delete", [clip](Timeline& t, const MediaPool&) { return edit::rippleDelete(t, {clip}); })};
-        if (op < 87) {
+        if (op < 78) {
+            switch (pick(0, m_asymmetric ? 5 : 3)) {
+            case 0: {
+                const Time at = frame(0, 900);
+                const Time length = frame(1, 60);
+                return {"insert gap",
+                        edit("Insert gap", [at, length](Timeline& t, const MediaPool&) { return edit::insertGap(t, at, length); })};
+            }
+            case 1: {
+                // Aim at an existing gap (most random points are not in one).
+                std::vector<std::pair<Id, Time>> gaps;
+                for (const Track& t : tl().tracks) {
+                    Time pos;
+                    for (const Item& item : t.items) {
+                        if (std::holds_alternative<Gap>(item))
+                            gaps.push_back({t.id, pos});
+                        pos += durationOf(item);
+                    }
+                }
+                if (gaps.empty())
+                    return {"delete gap (none)", false};
+                const auto [trackId, at] = any(gaps);
+                return {"delete gap",
+                        edit("Delete gap", [trackId, at](Timeline& t, const MediaPool&) { return edit::deleteGap(t, trackId, at); })};
+            }
+            case 2:
+                return {"delete gaps", edit("Delete gaps", [](Timeline& t, const MediaPool&) { return edit::deleteGaps(t); })};
+            case 3: {
+                const int direction = chance(50) ? 1 : -1;
+                return {"swap", edit("Swap", [clip, direction](Timeline& t, const MediaPool&) {
+                            return edit::swapClips(t, clip, direction);
+                        })};
+            }
+            case 4: {
+                if (!m_mayLock)
+                    return {"link (not yet)", false, false};
+                const Id other = randomClip();
+                Op result{"link", edit("Link", [clip, other](Timeline& t, const MediaPool&) {
+                              return edit::linkClips(t, {clip, other});
+                          })};
+                m_syncGuaranteed = false; // a link may join clips that are not in sync
+                return result;
+            }
+            default:
+                return {"unlink", edit("Unlink", [clip](Timeline& t, const MediaPool&) { return edit::unlinkClips(t, {clip}); })};
+            }
+        }
+        if (op < 81)
+            return {"delete", edit("Delete", [clip, linked](Timeline& t, const MediaPool&) {
+                        return edit::deleteClips(t, {clip}, linked);
+                    })};
+        if (op < 85)
+            return {"ripple delete", edit("Ripple delete", [clip, linked](Timeline& t, const MediaPool&) {
+                        return edit::rippleDelete(t, {clip}, linked);
+                    })};
+        if (op < 88) {
             std::vector<Id> selection{clip};
             if (chance(50))
                 selection.push_back(randomClip());
@@ -326,7 +410,7 @@ private:
     std::map<std::string, int> m_appliedBy;
 };
 
-// Five seeds of 4 000 edits: over 5 000 trims (ripple, roll, slip, slide, plain) really applied in each
+// Five seeds of 4 500 edits: over 5 000 trims (ripple, roll, slip, slide, plain) really applied in each
 // of the two runs, so more than 10 000 in all (spec §12, phase 2).
 void runSeeds(std::initializer_list<std::uint64_t> seeds, bool asymmetric)
 {
@@ -335,7 +419,7 @@ void runSeeds(std::initializer_list<std::uint64_t> seeds, bool asymmetric)
     for (std::uint64_t seed : seeds) {
         INFO("seed " << seed);
         RandomEditor editor(seed, asymmetric);
-        editor.run(4000);
+        editor.run(4500);
         trims += editor.trims();
         for (const auto& [name, n] : editor.appliedBy())
             applied[name] += n;
@@ -351,6 +435,16 @@ void runSeeds(std::initializer_list<std::uint64_t> seeds, bool asymmetric)
                              "decompose", "undo"})
         CHECK(applied[name] >= 20);
     CHECK(applied["add track"] >= 5); // capped at five tracks of each kind
+    // Phase 3 edits.
+    for (const char* name : {"append", "insert gap", "delete gaps", "swap"})
+        CHECK(applied[name] >= 20);
+    // These need empty sync-locked tracks around them, so they succeed rarely on dense timelines.
+    CHECK(applied["ripple overwrite"] >= 5);
+    CHECK(applied["delete gap"] >= 10);
+    if (asymmetric) {
+        CHECK(applied["link"] >= 20);
+        CHECK(applied["unlink"] >= 20);
+    }
     if (std::getenv("VE_PROPERTY_STATS"))
         WARN(counts.str());
 }

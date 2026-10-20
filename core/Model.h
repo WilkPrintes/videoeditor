@@ -132,6 +132,8 @@ struct ClipBase {
     TimeRange sourceRange;
     bool enabled = true;
     Id linkGroup;          // items sharing a non-empty group edit together (picture + sound)
+    std::string color;              // clip colour label (spec §6.8); empty = the default for its kind
+    std::vector<std::string> flags; // flag colours, sorted and unique
 
     bool operator==(const ClipBase&) const = default;
 };
@@ -212,6 +214,7 @@ struct Track {
     bool enabled = true;
     bool locked = false;  // edits skip locked tracks
     bool syncLock = true; // ripple edits shift this track too (spec §6.1)
+    std::string color;    // track colour label; empty = default
 
     Time duration() const;
     std::vector<PlacedItem> clips() const; // clip-like items with their timeline start

@@ -5,8 +5,12 @@
 #include "engine/Exporter.h"
 #include "engine/PlaybackEngine.h"
 #include "media/MediaProbe.h"
+#include "ui/EditIndexWidget.h"
 #include "ui/ExportDialog.h"
+#include "ui/InspectorWidget.h"
+#include "ui/LabelColors.h"
 #include "ui/MediaPoolWidget.h"
+#include "ui/SourceViewerPanel.h"
 #include "ui/TimelineWidget.h"
 #include "ui/ViewerWidget.h"
 
@@ -14,18 +18,25 @@
 #include <QActionGroup>
 #include <QApplication>
 #include <QCloseEvent>
+#include <QDir>
+#include <QDockWidget>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFontDatabase>
+#include <QFrame>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QProgressDialog>
-#include <QSplitter>
+#include <QSettings>
+#include <QSignalBlocker>
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QStyle>
+#include <QTabBar>
 #include <QThread>
 #include <QToolBar>
 #include <QToolButton>
@@ -34,13 +45,16 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <memory>
+#include <set>
 
 using ve::Time;
 
 namespace {
 
 constexpr const char* kGestureMergeKey = "timeline-gesture";
+constexpr int kLayoutVersion = 3; // of saveState(); bump when the docks change
 
 QString projectFilter()
 {
@@ -71,6 +85,70 @@ std::string utf8(const QString& s)
     return s.toStdString();
 }
 
+std::vector<ve::Id> ids(const QStringList& list)
+{
+    std::vector<ve::Id> out;
+    for (const QString& id : list)
+        out.push_back(utf8(id));
+    return out;
+}
+
+// Layouts live in an ini file of their own (QStandardPaths test mode keeps the tests out of it).
+std::unique_ptr<QSettings> layoutSettings()
+{
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    QDir().mkpath(dir);
+    return std::make_unique<QSettings>(dir + QStringLiteral("/layouts.ini"), QSettings::IniFormat);
+}
+
+// Preset names may hold any character; QSettings keys may not hold '/' or '\'.
+QString presetKey(const QString& name)
+{
+    return QString::fromLatin1(name.toUtf8().toPercentEncoding());
+}
+
+QString presetName(const QString& key)
+{
+    return QString::fromUtf8(QByteArray::fromPercentEncoding(key.toLatin1()));
+}
+
+const ve::ClipBase* findClipBase(const ve::Timeline& tl, const ve::Id& clipId)
+{
+    for (const ve::Track& t : tl.tracks) {
+        if (auto placed = t.findClip(clipId))
+            return placed->clip;
+    }
+    return nullptr;
+}
+
+const ve::Item* findItem(const ve::Timeline& tl, const ve::Id& clipId)
+{
+    for (const ve::Track& t : tl.tracks) {
+        if (auto placed = t.findClip(clipId))
+            return placed->item;
+    }
+    return nullptr;
+}
+
+// A submenu with one checkable action per colour (and "None" first when `withNone`).
+void addColorActions(QMenu* menu, const std::vector<labels::Named>& colors, const QString& current, bool withNone,
+                     const QString& objectPrefix, const std::function<void(const QString&)>& choose)
+{
+    auto* group = new QActionGroup(menu);
+    auto addOne = [&](const QString& id, const QString& name, const QIcon& icon) {
+        QAction* a = menu->addAction(icon, name);
+        a->setCheckable(true);
+        a->setChecked(id == current);
+        a->setObjectName(objectPrefix + id);
+        group->addAction(a);
+        QObject::connect(a, &QAction::triggered, menu, [choose, id] { choose(id); });
+    };
+    if (withNone)
+        addOne({}, QObject::tr("None"), {});
+    for (const labels::Named& c : colors)
+        addOne(qs(c.id), c.name, labels::swatch(c.color));
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent)
@@ -79,7 +157,9 @@ MainWindow::MainWindow(QWidget* parent)
 {
     m_project = ve::makeEmptyProject();
     buildUi();
+    buildDocks();
     buildActions();
+    connectPanels();
     m_commands.onChanged = [this] { onModelChanged(); };
     m_timeline->setProject(&m_project);
     onModelChanged();
@@ -94,6 +174,12 @@ MainWindow::~MainWindow()
 {
     m_ticker.stop();
     m_commands.onChanged = nullptr;
+    // The panels outlive the members (QWidget deletes children last); their last signals (a dock
+    // hidden, a selection cleared) must not reach this window any more.
+    m_viewer->removeEventFilter(this);
+    m_timeline->removeEventFilter(this);
+    for (QObject* child : findChildren<QObject*>())
+        disconnect(child, nullptr, this, nullptr);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -105,6 +191,9 @@ void MainWindow::buildUi()
     m_pool = new MediaPoolWidget;
     m_viewer = new ViewerWidget;
     m_timeline = new TimelineWidget;
+    m_source = new SourceViewerPanel;
+    m_inspector = new InspectorWidget;
+    m_index = new EditIndexWidget;
 
     auto makeButton = [this](QStyle::StandardPixmap icon, const QString& tip, auto slot) {
         auto* b = new QToolButton;
@@ -116,9 +205,13 @@ void MainWindow::buildUi()
         connect(b, &QToolButton::clicked, this, slot);
         return b;
     };
+    // The buttons under the timeline viewer drive the timeline; the source viewer has its own.
     auto* toStart = makeButton(QStyle::SP_MediaSkipBackward, tr("Go to start (Home)"), [this] { seekTo(Time(0)); });
     auto* prev = makeButton(QStyle::SP_MediaSeekBackward, tr("Previous frame (Left)"), [this] { stepFrames(-1); });
-    m_playButton = makeButton(QStyle::SP_MediaPlay, tr("Play / pause (Space)"), [this] { togglePlay(); });
+    m_playButton = makeButton(QStyle::SP_MediaPlay, tr("Play / pause (Space)"), [this] {
+        setActiveViewer(false);
+        togglePlay();
+    });
     auto* next = makeButton(QStyle::SP_MediaSeekForward, tr("Next frame (Right)"), [this] { stepFrames(1); });
     auto* toEnd = makeButton(QStyle::SP_MediaSkipForward, tr("Go to end (End)"), [this] {
         seekToFrame(ve::frameAt(m_project.timeline().duration(), m_project.timeline().rate) - 1);
@@ -142,31 +235,112 @@ void MainWindow::buildUi()
     transportLayout->addStretch(1);
     transportLayout->addWidget(m_duration);
 
-    auto* viewerPanel = new QWidget;
-    auto* viewerLayout = new QVBoxLayout(viewerPanel);
-    viewerLayout->setContentsMargins(0, 0, 0, 0);
+    // The timeline viewer is the central widget; every other panel is a dock around it.
+    m_viewerTitle = new QLabel;
+    m_viewerTitle->setContentsMargins(10, 4, 10, 2);
+    m_viewerPanel = new QFrame;
+    m_viewerPanel->setObjectName(QStringLiteral("timelineViewerPanel"));
+    m_viewerPanel->setStyleSheet(QStringLiteral("QFrame#timelineViewerPanel { border: 2px solid transparent; }"
+                                                "QFrame#timelineViewerPanel[active=\"true\"] { border: 2px solid rgb(240, 196, 76); }"));
+    auto* viewerLayout = new QVBoxLayout(m_viewerPanel);
+    viewerLayout->setContentsMargins(2, 2, 2, 2);
     viewerLayout->setSpacing(0);
+    viewerLayout->addWidget(m_viewerTitle);
     viewerLayout->addWidget(m_viewer, 1);
     viewerLayout->addWidget(transport);
-
-    auto* top = new QSplitter(Qt::Horizontal);
-    top->addWidget(m_pool);
-    top->addWidget(viewerPanel);
-    top->setStretchFactor(0, 0);
-    top->setStretchFactor(1, 1);
-    top->setSizes({300, 1300});
-
-    auto* main = new QSplitter(Qt::Vertical);
-    main->addWidget(top);
-    main->addWidget(m_timeline);
-    main->setStretchFactor(0, 3);
-    main->setStretchFactor(1, 2);
-    main->setSizes({600, 300});
-    setCentralWidget(main);
+    setCentralWidget(m_viewerPanel);
 
     m_status = new QLabel;
     statusBar()->addPermanentWidget(m_status);
 
+    // A click in a viewer (or in the timeline) makes it the active viewer.
+    m_viewer->installEventFilter(this);
+    m_timeline->installEventFilter(this);
+}
+
+void MainWindow::buildDocks()
+{
+    setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks
+                   | QMainWindow::GroupedDragging);
+    // The timeline spans the whole width under the viewers, as on the Edit page of other editors.
+    setCorner(Qt::BottomLeftCorner, Qt::BottomDockWidgetArea);
+    setCorner(Qt::BottomRightCorner, Qt::BottomDockWidgetArea);
+
+    // Timeline panel: one tab per timeline of the project, "+" for a new one, the track view.
+    m_timelineTabs = new QTabBar;
+    m_timelineTabs->setObjectName(QStringLiteral("timelineTabs"));
+    m_timelineTabs->setDocumentMode(true);
+    m_timelineTabs->setExpanding(false);
+    m_timelineTabs->setDrawBase(false);
+    m_timelineTabs->setFocusPolicy(Qt::NoFocus);
+    m_timelineTabs->setContextMenuPolicy(Qt::CustomContextMenu);
+    auto* newTab = new QToolButton;
+    newTab->setObjectName(QStringLiteral("newTimelineButton"));
+    newTab->setText(QStringLiteral("+"));
+    newTab->setToolTip(tr("New Timeline (Ctrl+Alt+N)"));
+    newTab->setAutoRaise(true);
+    newTab->setFocusPolicy(Qt::NoFocus);
+    connect(newTab, &QToolButton::clicked, this, [this] { newTimeline(); });
+    auto* tabRow = new QHBoxLayout;
+    tabRow->setContentsMargins(4, 0, 4, 0);
+    tabRow->setSpacing(2);
+    tabRow->addWidget(m_timelineTabs);
+    tabRow->addWidget(newTab);
+    tabRow->addStretch(1);
+    auto* timelinePanel = new QWidget;
+    auto* timelineLayout = new QVBoxLayout(timelinePanel);
+    timelineLayout->setContentsMargins(0, 0, 0, 0);
+    timelineLayout->setSpacing(0);
+    timelineLayout->addLayout(tabRow);
+    timelineLayout->addWidget(m_timeline, 1);
+
+    auto dock = [this](const QString& title, const char* name, QWidget* widget) {
+        auto* d = new QDockWidget(title, this);
+        d->setObjectName(QLatin1String(name));
+        d->setWidget(widget);
+        return d;
+    };
+    m_poolDock = dock(tr("Media Pool"), "dockMediaPool", m_pool);
+    m_indexDock = dock(tr("Edit Index"), "dockEditIndex", m_index);
+    m_sourceDock = dock(tr("Source Viewer"), "dockSourceViewer", m_source);
+    m_inspectorDock = dock(tr("Inspector"), "dockInspector", m_inspector);
+    m_timelineDock = dock(tr("Timeline"), "dockTimeline", timelinePanel);
+    applyDefaultLayout();
+}
+
+void MainWindow::applyDefaultLayout()
+{
+    const QList<QDockWidget*> docks = {m_poolDock, m_indexDock, m_sourceDock, m_inspectorDock, m_timelineDock};
+    for (QDockWidget* d : docks) {
+        d->setFloating(false);
+        removeDockWidget(d);
+    }
+    // Media pool (with the edit index behind it) | source viewer | timeline viewer | inspector,
+    // the timeline underneath.
+    addDockWidget(Qt::LeftDockWidgetArea, m_poolDock);
+    splitDockWidget(m_poolDock, m_sourceDock, Qt::Horizontal);
+    tabifyDockWidget(m_poolDock, m_indexDock);
+    addDockWidget(Qt::RightDockWidgetArea, m_inspectorDock);
+    addDockWidget(Qt::BottomDockWidgetArea, m_timelineDock);
+    for (QDockWidget* d : docks)
+        d->show();
+    if (isVisible())
+        sizeDefaultDocks();
+}
+
+void MainWindow::sizeDefaultDocks()
+{
+    // The two viewers share what the pool and the inspector leave.
+    const int pool = 280;
+    const int inspector = 300;
+    const int viewers = std::max(400, width() - pool - inspector);
+    resizeDocks({m_poolDock, m_sourceDock, m_inspectorDock}, {pool, viewers / 2, inspector}, Qt::Horizontal);
+    resizeDocks({m_timelineDock}, {std::max(260, int(height() * 0.42))}, Qt::Vertical);
+    m_poolDock->raise(); // over the edit index (a raise before the window is shown is lost)
+}
+
+void MainWindow::connectPanels()
+{
     connect(m_viewer, &ViewerWidget::backendReady, this, [this](const QString& name) {
         m_gpuBackend = name;
         updateWindowState();
@@ -184,12 +358,11 @@ void MainWindow::buildUi()
         else
             m_commands.abort();
     });
-    connect(m_timeline, &TimelineWidget::moveRequested, this, [this](const QStringList& ids, Time delta, int shift) {
-        std::vector<ve::Id> clips;
-        for (const QString& id : ids)
-            clips.push_back(utf8(id));
-        edit(tr("Move"), [clips, delta, shift](ve::Timeline& tl, const ve::MediaPool&) {
-            return ve::edit::moveClips(tl, clips, delta, shift);
+    connect(m_timeline, &TimelineWidget::moveRequested, this, [this](const QStringList& clipIds, Time delta, int shift) {
+        const std::vector<ve::Id> clips = ids(clipIds);
+        const bool linked = linkedSelection();
+        edit(tr("Move"), [clips, delta, shift, linked](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::moveClips(tl, clips, delta, shift, linked);
         }, kGestureMergeKey);
     });
     connect(m_timeline, &TimelineWidget::trimRequested, this, [this](const QString& id, bool head, Time edge, bool linked) {
@@ -247,11 +420,139 @@ void MainWindow::buildUi()
             [this](const QString& mediaId, Time at, const QString& trackId) { placeMediaAt(mediaId, at, trackId); });
     connect(m_timeline, &TimelineWidget::filesDropped, this,
             [this](const QStringList& paths, Time at) { importFiles(paths, at); });
-    connect(m_timeline, &TimelineWidget::selectionChanged, this, &MainWindow::updateWindowState);
-    connect(m_pool, &MediaPoolWidget::mediaActivated, this,
-            [this](const QString& id) { placeMediaAt(id, std::nullopt); });
+    connect(m_timeline, &TimelineWidget::selectionChanged, this, [this] {
+        updateWindowState();
+        refreshPanels();
+    });
+    connect(m_timeline, &TimelineWidget::contextMenuRequested, this,
+            [this](const TimelineWidget::Context& context, const QPoint& globalPos) {
+        setActiveViewer(false);
+        if (auto menu = contextMenu(context); menu && !menu->isEmpty())
+            menu->exec(globalPos);
+    });
+    connect(m_timeline, &TimelineWidget::openCompoundRequested, this, &MainWindow::openCompound);
+
+    // Media pool: a double-click opens the media in the source viewer.
+    connect(m_pool, &MediaPoolWidget::mediaActivated, this, &MainWindow::openInSourceViewer);
     connect(m_pool, &MediaPoolWidget::filesDropped, this, [this](const QStringList& paths) { importFiles(paths); });
     connect(m_pool, &QListWidget::itemSelectionChanged, this, &MainWindow::updateWindowState);
+
+    // Source viewer.
+    connect(m_source, &SourceViewerPanel::activated, this, [this] { setActiveViewer(true); });
+    connect(m_source, &SourceViewerPanel::marksChanged, this, &MainWindow::updateWindowState);
+    connect(m_sourceDock->toggleViewAction(), &QAction::toggled, this, [this](bool shown) {
+        if (!shown)
+            setActiveViewer(false);
+    });
+
+    // Timeline tabs.
+    connect(m_timelineTabs, &QTabBar::currentChanged, this, [this](int index) {
+        if (index >= 0)
+            openTimeline(utf8(m_timelineTabs->tabData(index).toString()));
+    });
+    connect(m_timelineTabs, &QTabBar::customContextMenuRequested, this, [this](const QPoint& pos) {
+        const int index = m_timelineTabs->tabAt(pos);
+        if (index < 0)
+            return;
+        openTimeline(utf8(m_timelineTabs->tabData(index).toString()));
+        QMenu menu;
+        menu.addAction(tr("Rename Timeline..."), this, [this] { renameTimeline(); });
+        menu.addAction(tr("Duplicate Timeline"), this, [this] { duplicateTimeline(); });
+        menu.addSeparator();
+        menu.addAction(tr("Delete Timeline"), this, [this] { deleteTimeline(); });
+        menu.exec(m_timelineTabs->mapToGlobal(pos));
+    });
+
+    // Edit index: a row selects that clip or marker and moves the playhead to it.
+    connect(m_indexDock, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+        if (visible)
+            m_index->setTimeline(m_project.timeline(), m_project.media);
+    });
+    connect(m_index, &EditIndexWidget::clipActivated, this, [this](const QString& id) {
+        const ve::Id clip = utf8(id);
+        m_timeline->selectClips({clip});
+        for (const ve::Track& t : m_project.timeline().tracks) {
+            if (auto placed = t.findClip(clip))
+                seekTo(placed->start);
+        }
+        setActiveViewer(false);
+    });
+    connect(m_index, &EditIndexWidget::markerActivated, this, [this](const QString& id) {
+        const ve::Id marker = utf8(id);
+        m_timeline->selectMarker(marker);
+        if (const ve::Marker* m = ve::edit::findMarker(m_project.timeline(), marker))
+            seekTo(m->start);
+        setActiveViewer(false);
+    });
+
+    // Inspector: every change is one undoable edit.
+    connect(m_inspector, &InspectorWidget::timelineRenamed, this, [this](const QString& name) {
+        const ve::Id id = m_project.currentTimeline;
+        if (!editProject(tr("Rename Timeline"), [id, name](ve::Project& p) { return ve::edit::renameTimeline(p, id, utf8(name)); }))
+            refreshPanels(); // back to the name it has
+    });
+    connect(m_inspector, &InspectorWidget::clipsRenamed, this, [this](const QStringList& clipIds, const QString& name) {
+        const std::vector<ve::Id> clips = ids(clipIds);
+        edit(tr("Rename Clip"), [clips, name](ve::Timeline& tl, const ve::MediaPool&) {
+            bool changed = false;
+            for (const ve::Id& id : clips)
+                changed |= ve::edit::renameClip(tl, id, utf8(name));
+            return changed;
+        });
+    });
+    connect(m_inspector, &InspectorWidget::clipColorChosen, this, [this](const QStringList& clipIds, const QString& color) {
+        const std::vector<ve::Id> clips = ids(clipIds);
+        edit(tr("Clip Color"), [clips, color](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::setClipColor(tl, clips, utf8(color));
+        });
+    });
+    connect(m_inspector, &InspectorWidget::clipFlagToggled, this,
+            [this](const QStringList& clipIds, const QString& color, bool on) {
+        const std::vector<ve::Id> clips = ids(clipIds);
+        edit(on ? tr("Add Flag") : tr("Remove Flag"), [clips, color, on](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::setClipFlag(tl, clips, utf8(color), on);
+        });
+    });
+    connect(m_inspector, &InspectorWidget::clipsEnabledChanged, this, [this](const QStringList& clipIds, bool on) {
+        const std::vector<ve::Id> clips = ids(clipIds);
+        edit(on ? tr("Enable Clip") : tr("Disable Clip"), [clips, on](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::setClipsEnabled(tl, clips, on);
+        });
+    });
+    connect(m_inspector, &InspectorWidget::markerEdited, this, [this](const ve::Marker& marker) {
+        if (!edit(tr("Edit Marker"), [marker](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::updateMarker(tl, marker); }))
+            refreshPanels();
+    });
+    connect(m_inspector, &InspectorWidget::trackRenamed, this, [this](const QString& trackId, const QString& name) {
+        const ve::Id track = utf8(trackId);
+        if (!edit(tr("Rename Track"), [track, name](ve::Timeline& tl, const ve::MediaPool&) {
+                return ve::edit::renameTrack(tl, track, utf8(name));
+            })) {
+            statusBar()->showMessage(tr("Another track already has that name"), 4000);
+            refreshPanels();
+        }
+    });
+    connect(m_inspector, &InspectorWidget::trackColorChosen, this, [this](const QString& trackId, const QString& color) {
+        const ve::Id track = utf8(trackId);
+        edit(tr("Track Color"), [track, color](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::setTrackColor(tl, track, utf8(color));
+        });
+    });
+    connect(m_inspector, &InspectorWidget::trackLockChanged, this, [this](const QString& trackId, bool on) {
+        const ve::Id track = utf8(trackId);
+        edit(on ? tr("Lock Track") : tr("Unlock Track"),
+             [track, on](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::setTrackLocked(tl, track, on); });
+    });
+    connect(m_inspector, &InspectorWidget::trackSyncLockChanged, this, [this](const QString& trackId, bool on) {
+        const ve::Id track = utf8(trackId);
+        edit(on ? tr("Sync Lock Track") : tr("Remove Sync Lock"),
+             [track, on](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::setTrackSyncLock(tl, track, on); });
+    });
+    connect(m_inspector, &InspectorWidget::trackEnabledChanged, this, [this](const QString& trackId, bool on) {
+        const ve::Id track = utf8(trackId);
+        edit(on ? tr("Enable Track") : tr("Disable Track"),
+             [track, on](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::setTrackEnabled(tl, track, on); });
+    });
 }
 
 void MainWindow::buildActions()
@@ -304,6 +605,50 @@ void MainWindow::buildActions()
                             [this](bool on) { m_timeline->setSnapping(on); });
     snapping->setCheckable(true);
     snapping->setChecked(true);
+    m_linkedSelectionAction = add(editMenu, tr("&Linked Selection"), {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_L)},
+                                  [this](bool on) { m_timeline->setLinkedSelection(on); });
+    m_linkedSelectionAction->setCheckable(true);
+    m_linkedSelectionAction->setChecked(true);
+    m_linkedSelectionAction->setToolTip(tr("Clicking a clip selects its linked picture or sound too (Ctrl+Shift+L)"));
+
+    QMenu* clipMenu = menuBar()->addMenu(tr("&Clip"));
+    QMenu* colorMenu = clipMenu->addMenu(tr("Clip &Color"));
+    QMenu* flagMenu = clipMenu->addMenu(tr("&Flags"));
+    connect(clipMenu, &QMenu::aboutToShow, this, [this, colorMenu, flagMenu] { fillLabelMenus(colorMenu, flagMenu, QStringLiteral("action")); });
+    QAction* enableClip = add(clipMenu, tr("&Enable / Disable Clip"), {QKeySequence(Qt::Key_D)}, [this] { toggleSelectionEnabled(); });
+    QAction* linkClips = add(clipMenu, tr("&Link / Unlink Clips"), {QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_L)}, [this] {
+        // All selected clips in one group: unlink them; otherwise link them.
+        const std::vector<ve::Id> selected = selection();
+        std::set<ve::Id> groups;
+        for (const ve::Id& id : selected) {
+            if (const ve::ClipBase* c = findClipBase(m_project.timeline(), id))
+                groups.insert(c->linkGroup);
+        }
+        if (groups.size() == 1 && !groups.begin()->empty())
+            unlinkSelection();
+        else
+            linkSelection();
+    });
+    QAction* renameClip = add(clipMenu, tr("&Rename Clip..."), {QKeySequence(Qt::Key_F2)}, [this] { renameSelectionInteractive(); });
+    clipMenu->addSeparator();
+    QAction* swapLeft = add(clipMenu, tr("Swap with &Previous Clip"), {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Comma)},
+                            [this] { swapSelection(-1); });
+    QAction* swapRight = add(clipMenu, tr("Swap with &Next Clip"), {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Period)},
+                             [this] { swapSelection(1); });
+    clipMenu->addSeparator();
+    m_composeAction = add(clipMenu, tr("New &Compound Clip"), {QKeySequence(Qt::ALT | Qt::Key_C)},
+                          [this] { composeSelection(); });
+    m_openCompoundAction = add(clipMenu, tr("&Open Compound Clip in Timeline"), {}, [this] {
+        for (const ve::Id& id : selection()) {
+            if (const ve::Item* item = findItem(m_project.timeline(), id); item && std::holds_alternative<ve::CompoundClip>(*item)) {
+                openCompound(qs(id));
+                return;
+            }
+        }
+    });
+    m_decomposeAction = add(clipMenu, tr("&Decompose Compound Clip"), {QKeySequence(Qt::ALT | Qt::SHIFT | Qt::Key_C)},
+                            [this] { decomposeSelection(); });
+    m_selectionActions = {colorMenu->menuAction(), flagMenu->menuAction(), enableClip, linkClips, renameClip, swapLeft, swapRight};
 
     QMenu* timelineMenu = menuBar()->addMenu(tr("&Timeline"));
     const std::pair<SourceEdit, std::pair<QString, QList<QKeySequence>>> sourceEdits[] = {
@@ -312,13 +657,17 @@ void MainWindow::buildActions()
         {SourceEdit::Replace, {tr("&Replace"), {QKeySequence(Qt::Key_F11)}}},
         {SourceEdit::FitToFill, {tr("&Fit to Fill"), {QKeySequence(Qt::SHIFT | Qt::Key_F11)}}},
         {SourceEdit::PlaceOnTop, {tr("Place on &Top"), {QKeySequence(Qt::Key_F12)}}},
+        {SourceEdit::Append, {tr("&Append at End"), {QKeySequence(Qt::SHIFT | Qt::Key_F12)}}},
+        {SourceEdit::RippleOverwrite, {tr("Ripple O&verwrite"), {QKeySequence(Qt::SHIFT | Qt::Key_F10)}}},
     };
-    const char* sourceEditNames[] = {"actionInsert", "actionOverwrite", "actionReplace", "actionFitToFill", "actionPlaceOnTop"};
+    const char* sourceEditNames[] = {"actionInsert",    "actionOverwrite", "actionReplace",        "actionFitToFill",
+                                     "actionPlaceOnTop", "actionAppend",    "actionRippleOverwrite"};
     for (std::size_t i = 0; i < std::size(sourceEdits); ++i) {
         const SourceEdit kind = sourceEdits[i].first;
         QAction* a = add(timelineMenu, sourceEdits[i].second.first, sourceEdits[i].second.second, [this, kind] { sourceEdit(kind); });
         a->setObjectName(QLatin1String(sourceEditNames[i]));
-        a->setToolTip(tr("Edits the media selected in the pool onto the destination tracks, at the playhead or the In/Out"));
+        a->setToolTip(tr("Edits the source viewer's clip (or the media selected in the pool) onto the destination "
+                         "tracks, at the playhead or the In/Out"));
         m_sourceEditActions << a;
     }
     timelineMenu->addSeparator();
@@ -332,37 +681,59 @@ void MainWindow::buildActions()
     add(timelineMenu, tr("Previous Edit"), {QKeySequence(Qt::Key_Up)}, [this] { jumpToEdit(-1); });
     add(timelineMenu, tr("Next Edit"), {QKeySequence(Qt::Key_Down)}, [this] { jumpToEdit(1); });
     timelineMenu->addSeparator();
+    QAction* insertGap = add(timelineMenu, tr("Insert &Gap (In to Out, or one second)"), {}, [this] { insertGapAtPlayhead(); });
+    QAction* deleteGaps = add(timelineMenu, tr("Delete All &Gaps"), {}, [this] { deleteAllGaps(); });
+    timelineMenu->addSeparator();
     QAction* addVideoTrack = add(timelineMenu, tr("Add &Video Track"), {QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_V)},
                                  [this] { addTrack(ve::TrackKind::Video); });
     QAction* addAudioTrack = add(timelineMenu, tr("Add &Audio Track"), {QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_A)},
                                  [this] { addTrack(ve::TrackKind::Audio); });
     timelineMenu->addSeparator();
-    m_composeAction = add(timelineMenu, tr("New &Compound Clip"), {QKeySequence(Qt::ALT | Qt::Key_C)},
-                          [this] { composeSelection(); });
-    m_decomposeAction = add(timelineMenu, tr("&Decompose Compound Clip"), {QKeySequence(Qt::ALT | Qt::SHIFT | Qt::Key_C)},
-                            [this] { decomposeSelection(); });
+    QAction* newTimelineAction = add(timelineMenu, tr("&New Timeline"), {QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_N)},
+                                     [this] { newTimeline(); });
+    QAction* duplicateTimelineAction = add(timelineMenu, tr("D&uplicate Timeline"), {}, [this] { duplicateTimeline(); });
+    add(timelineMenu, tr("Rena&me Timeline..."), {}, [this] { renameTimeline(); });
+    QAction* deleteTimelineAction = add(timelineMenu, tr("De&lete Timeline"), {}, [this] { deleteTimeline(); });
 
     QMenu* playback = menuBar()->addMenu(tr("&Playback"));
-    QAction* playPause = add(playback, tr("Play / Pause"), {QKeySequence(Qt::Key_Space)}, [this] { togglePlay(); });
-    add(playback, tr("Play"), {QKeySequence(Qt::Key_L)}, [this] { play(); });
-    add(playback, tr("Pause"), {QKeySequence(Qt::Key_K)}, [this] { m_engine->pause(); });
+    // These go to the active viewer (the source or the timeline).
+    QAction* playPause = add(playback, tr("Play / Pause"), {QKeySequence(Qt::Key_Space)}, [this] { transportToggle(); });
+    add(playback, tr("Play"), {QKeySequence(Qt::Key_L)}, [this] { transportPlay(); });
+    add(playback, tr("Pause"), {QKeySequence(Qt::Key_K)}, [this] { transportPause(); });
     playback->addSeparator();
-    add(playback, tr("Previous Frame"), {QKeySequence(Qt::Key_Left)}, [this] { stepFrames(-1); });
-    add(playback, tr("Next Frame"), {QKeySequence(Qt::Key_Right)}, [this] { stepFrames(1); });
+    add(playback, tr("Previous Frame"), {QKeySequence(Qt::Key_Left)}, [this] { transportStep(-1); });
+    add(playback, tr("Next Frame"), {QKeySequence(Qt::Key_Right)}, [this] { transportStep(1); });
     add(playback, tr("Back One Second"), {QKeySequence(Qt::SHIFT | Qt::Key_Left)},
-        [this, oneSecond] { stepFrames(-oneSecond()); });
+        [this, oneSecond] { transportStep(-oneSecond()); });
     add(playback, tr("Forward One Second"), {QKeySequence(Qt::SHIFT | Qt::Key_Right)},
-        [this, oneSecond] { stepFrames(oneSecond()); });
-    add(playback, tr("Go to Start"), {QKeySequence(Qt::Key_Home)}, [this] { seekTo(Time(0)); });
-    add(playback, tr("Go to End"), {QKeySequence(Qt::Key_End)}, [this] {
-        seekToFrame(ve::frameAt(m_project.timeline().duration(), m_project.timeline().rate) - 1);
-    });
+        [this, oneSecond] { transportStep(oneSecond()); });
+    add(playback, tr("Go to Start"), {QKeySequence(Qt::Key_Home)}, [this] { transportToStart(); });
+    add(playback, tr("Go to End"), {QKeySequence(Qt::Key_End)}, [this] { transportToEnd(); });
 
     QMenu* view = menuBar()->addMenu(tr("&View"));
     add(view, tr("Zoom In"), {QKeySequence(Qt::CTRL | Qt::Key_Equal), QKeySequence(Qt::CTRL | Qt::Key_Plus)},
         [this] { m_timeline->zoomBy(1.5); });
     add(view, tr("Zoom Out"), {QKeySequence(Qt::CTRL | Qt::Key_Minus)}, [this] { m_timeline->zoomBy(1.0 / 1.5); });
     add(view, tr("Zoom to Fit"), {QKeySequence(Qt::SHIFT | Qt::Key_Z)}, [this] { m_timeline->zoomToFit(); });
+
+    // Workspace (spec phase 3.3): panels, the active viewer and layout presets.
+    QMenu* workspace = menuBar()->addMenu(tr("&Workspace"));
+    const std::pair<QDockWidget*, const char*> panels[] = {
+        {m_poolDock, "actionShowMediaPool"},    {m_indexDock, "actionShowEditIndex"}, {m_sourceDock, "actionShowSourceViewer"},
+        {m_inspectorDock, "actionShowInspector"}, {m_timelineDock, "actionShowTimeline"},
+    };
+    for (const auto& [dock, name] : panels) {
+        QAction* a = dock->toggleViewAction();
+        a->setObjectName(QLatin1String(name));
+        workspace->addAction(a);
+    }
+    workspace->addSeparator();
+    QAction* switchViewer = add(workspace, tr("Switch &Viewer (source / timeline)"), {QKeySequence(Qt::Key_Q)},
+                                [this] { setActiveViewer(!m_sourceActive); });
+    workspace->addSeparator();
+    m_presetsMenu = workspace->addMenu(tr("Layout &Presets"));
+    connect(m_presetsMenu, &QMenu::aboutToShow, this, &MainWindow::refreshPresetsMenu);
+    QAction* resetLayoutAction = add(workspace, tr("&Reset Layout"), {}, [this] { resetLayout(); });
 
     QMenu* help = menuBar()->addMenu(tr("&Help"));
     add(help, tr("&About"), {}, [this] {
@@ -384,15 +755,30 @@ void MainWindow::buildActions()
     selectTool->setObjectName(QStringLiteral("actionSelectTool"));
     trimTool->setObjectName(QStringLiteral("actionTrimTool"));
     snapping->setObjectName(QStringLiteral("actionSnapping"));
+    m_linkedSelectionAction->setObjectName(QStringLiteral("actionLinkedSelection"));
+    enableClip->setObjectName(QStringLiteral("actionEnableClip"));
+    linkClips->setObjectName(QStringLiteral("actionLinkClips"));
+    renameClip->setObjectName(QStringLiteral("actionRenameClip"));
+    swapLeft->setObjectName(QStringLiteral("actionSwapLeft"));
+    swapRight->setObjectName(QStringLiteral("actionSwapRight"));
     markInAction->setObjectName(QStringLiteral("actionMarkIn"));
     markOutAction->setObjectName(QStringLiteral("actionMarkOut"));
     addMarkerAction->setObjectName(QStringLiteral("actionAddMarker"));
+    insertGap->setObjectName(QStringLiteral("actionInsertGap"));
+    deleteGaps->setObjectName(QStringLiteral("actionDeleteGaps"));
     addVideoTrack->setObjectName(QStringLiteral("actionAddVideoTrack"));
     addAudioTrack->setObjectName(QStringLiteral("actionAddAudioTrack"));
+    newTimelineAction->setObjectName(QStringLiteral("actionNewTimeline"));
+    duplicateTimelineAction->setObjectName(QStringLiteral("actionDuplicateTimeline"));
+    deleteTimelineAction->setObjectName(QStringLiteral("actionDeleteTimeline"));
     m_composeAction->setObjectName(QStringLiteral("actionCompose"));
+    m_openCompoundAction->setObjectName(QStringLiteral("actionOpenCompound"));
     m_decomposeAction->setObjectName(QStringLiteral("actionDecompose"));
+    switchViewer->setObjectName(QStringLiteral("actionSwitchViewer"));
+    resetLayoutAction->setObjectName(QStringLiteral("actionResetLayout"));
 
     QToolBar* bar = addToolBar(tr("Main"));
+    bar->setObjectName(QStringLiteral("mainToolBar"));
     bar->setMovable(false);
     bar->setToolButtonStyle(Qt::ToolButtonTextOnly);
     bar->addAction(importAction);
@@ -404,6 +790,7 @@ void MainWindow::buildActions()
     bar->addAction(selectTool);
     bar->addAction(trimTool);
     bar->addAction(snapping);
+    bar->addAction(m_linkedSelectionAction);
     bar->addSeparator();
     bar->addAction(m_splitAction);
     bar->addAction(m_deleteAction);
@@ -415,12 +802,281 @@ void MainWindow::buildActions()
     bar->addAction(addMarkerAction);
 }
 
+void MainWindow::fillLabelMenus(QMenu* colorMenu, QMenu* flagMenu, const QString& objectPrefix)
+{
+    // What the whole selection shares: its colour (empty when they differ) and the flags all have.
+    const std::vector<ve::Id> selected = selection();
+    std::set<std::string> colors;
+    std::map<std::string, std::size_t> flagCount;
+    for (const ve::Id& id : selected) {
+        if (const ve::ClipBase* c = findClipBase(m_project.timeline(), id)) {
+            colors.insert(c->color);
+            for (const std::string& f : c->flags)
+                ++flagCount[f];
+        }
+    }
+    const QString current = colors.size() == 1 ? qs(*colors.begin()) : QStringLiteral("?");
+
+    for (QMenu* menu : {colorMenu, flagMenu}) {
+        qDeleteAll(menu->findChildren<QActionGroup*>(Qt::FindDirectChildrenOnly));
+        menu->clear();
+    }
+    addColorActions(colorMenu, labels::clipColors(), current, true, objectPrefix + QStringLiteral("ClipColor:"),
+                    [this](const QString& color) { setSelectionColor(color); });
+
+    for (const labels::Named& f : labels::flagColors()) {
+        const QString id = qs(f.id);
+        const bool all = !selected.empty() && flagCount[f.id] == selected.size();
+        QAction* a = flagMenu->addAction(labels::swatch(f.color), f.name);
+        a->setCheckable(true);
+        a->setChecked(all);
+        a->setObjectName(objectPrefix + QStringLiteral("Flag:") + id);
+        connect(a, &QAction::triggered, this, [this, id, all] { setSelectionFlag(id, !all); });
+    }
+    flagMenu->addSeparator();
+    QAction* clear = flagMenu->addAction(tr("Clear All Flags"), this, [this] { clearSelectionFlags(); });
+    clear->setObjectName(objectPrefix + QStringLiteral("ClearFlags"));
+}
+
+std::unique_ptr<QMenu> MainWindow::contextMenu(const TimelineWidget::Context& context)
+{
+    auto menu = std::make_unique<QMenu>(this);
+    QMenu* m = menu.get();
+    auto action = [m](const QString& text, const char* name, auto slot) {
+        QAction* a = m->addAction(text);
+        a->setObjectName(QLatin1String(name));
+        QObject::connect(a, &QAction::triggered, m, slot);
+        return a;
+    };
+    const ve::Timeline& tl = m_project.timeline();
+    using Kind = TimelineWidget::Context::Kind;
+
+    switch (context.kind) {
+    case Kind::Clip: {
+        const ve::Id clipId = utf8(context.clipId);
+        const ve::ClipBase* clip = findClipBase(tl, clipId);
+        const ve::Item* item = findItem(tl, clipId);
+        if (!clip || !item)
+            return {};
+        action(tr("Rename Clip..."), "contextRenameClip", [this] { renameSelectionInteractive(); });
+        QMenu* colorMenu = m->addMenu(tr("Clip Color"));
+        QMenu* flagMenu = m->addMenu(tr("Flags"));
+        fillLabelMenus(colorMenu, flagMenu, QStringLiteral("context"));
+        QAction* enabled = action(tr("Enable Clip"), "contextEnableClip", [this] { toggleSelectionEnabled(); });
+        enabled->setCheckable(true);
+        enabled->setChecked(clip->enabled);
+        const bool isLinked = !clip->linkGroup.empty() && ve::edit::linkedGroup(tl, clipId).size() > 1;
+        QAction* link = action(tr("Link Clips"), "contextLinkClips", [this, isLinked] {
+            if (isLinked)
+                unlinkSelection();
+            else
+                linkSelection();
+        });
+        link->setCheckable(true);
+        link->setChecked(isLinked);
+        m->addSeparator();
+        if (const auto* media = std::get_if<ve::Clip>(item)) {
+            const QString mediaId = qs(media->mediaId);
+            action(tr("Open in Source Viewer"), "contextOpenInSource", [this, mediaId] { openInSourceViewer(mediaId); });
+        }
+        if (std::holds_alternative<ve::CompoundClip>(*item)) {
+            const QString id = context.clipId;
+            action(tr("Open in Timeline"), "contextOpenCompound", [this, id] { openCompound(id); });
+            action(tr("Decompose in Place"), "contextDecompose", [this] { decomposeSelection(); });
+        } else {
+            action(tr("New Compound Clip"), "contextCompose", [this] { composeSelection(); });
+        }
+        m->addSeparator();
+        action(tr("Swap with Previous Clip"), "contextSwapLeft", [this] { swapSelection(-1); });
+        action(tr("Swap with Next Clip"), "contextSwapRight", [this] { swapSelection(1); });
+        m->addSeparator();
+        action(tr("Delete"), "contextDelete", [this] { deleteSelection(); });
+        action(tr("Ripple Delete"), "contextRippleDelete", [this] { rippleDeleteSelection(); });
+        break;
+    }
+    case Kind::Gap: {
+        const QString trackId = context.trackId;
+        const Time at = context.at;
+        action(tr("Ripple Delete Gap"), "contextDeleteGap", [this, trackId, at] { deleteGapAt(trackId, at); });
+        action(tr("Delete All Gaps"), "contextDeleteGaps", [this] { deleteAllGaps(); });
+        break;
+    }
+    case Kind::TrackHeader: {
+        const ve::Track* track = tl.track(utf8(context.trackId));
+        if (!track)
+            return {};
+        const QString trackId = context.trackId;
+        const ve::Id id = track->id;
+        action(tr("Rename Track..."), "contextRenameTrack", [this, trackId] { renameTrackInteractive(trackId); });
+        QMenu* colorMenu = m->addMenu(tr("Track Color"));
+        addColorActions(colorMenu, labels::clipColors(), qs(track->color), true, QStringLiteral("contextTrackColor:"),
+                        [this, id](const QString& color) {
+            edit(tr("Track Color"), [id, color](ve::Timeline& t, const ve::MediaPool&) {
+                return ve::edit::setTrackColor(t, id, utf8(color));
+            });
+        });
+        const bool enabled = track->enabled;
+        const bool locked = track->locked;
+        const bool syncLock = track->syncLock;
+        QAction* enable = action(tr("Enable Track"), "contextEnableTrack", [this, id, enabled] {
+            edit(enabled ? tr("Disable Track") : tr("Enable Track"),
+                 [id, enabled](ve::Timeline& t, const ve::MediaPool&) { return ve::edit::setTrackEnabled(t, id, !enabled); });
+        });
+        enable->setCheckable(true);
+        enable->setChecked(enabled);
+        QAction* lock = action(tr("Lock Track"), "contextLockTrack", [this, id, locked] {
+            edit(locked ? tr("Unlock Track") : tr("Lock Track"),
+                 [id, locked](ve::Timeline& t, const ve::MediaPool&) { return ve::edit::setTrackLocked(t, id, !locked); });
+        });
+        lock->setCheckable(true);
+        lock->setChecked(locked);
+        QAction* sync = action(tr("Sync Lock"), "contextSyncLock", [this, id, syncLock] {
+            edit(syncLock ? tr("Remove Sync Lock") : tr("Sync Lock Track"),
+                 [id, syncLock](ve::Timeline& t, const ve::MediaPool&) { return ve::edit::setTrackSyncLock(t, id, !syncLock); });
+        });
+        sync->setCheckable(true);
+        sync->setChecked(syncLock);
+        m->addSeparator();
+        action(tr("Add Video Track"), "contextAddVideoTrack", [this] { addTrack(ve::TrackKind::Video); });
+        action(tr("Add Audio Track"), "contextAddAudioTrack", [this] { addTrack(ve::TrackKind::Audio); });
+        break;
+    }
+    case Kind::Marker: {
+        const ve::Marker* marker = ve::edit::findMarker(tl, utf8(context.markerId));
+        if (!marker)
+            return {};
+        const ve::Marker copy = *marker;
+        action(tr("Go to Marker"), "contextGoToMarker", [this, copy] { seekTo(copy.start); });
+        QMenu* colorMenu = m->addMenu(tr("Marker Color"));
+        addColorActions(colorMenu, labels::markerColors(), qs(copy.color), false, QStringLiteral("contextMarkerColor:"),
+                        [this, copy](const QString& color) {
+            ve::Marker changed = copy;
+            changed.color = utf8(color);
+            edit(tr("Marker Color"), [changed](ve::Timeline& t, const ve::MediaPool&) { return ve::edit::updateMarker(t, changed); });
+        });
+        m->addSeparator();
+        const ve::Id id = copy.id;
+        action(tr("Delete Marker"), "contextDeleteMarker", [this, id] {
+            edit(tr("Delete Marker"), [id](ve::Timeline& t, const ve::MediaPool&) { return ve::edit::removeMarker(t, id); });
+        });
+        break;
+    }
+    case Kind::Ruler:
+    case Kind::Empty: {
+        const Time at = ve::floorToFrame(context.at, tl.rate);
+        action(tr("Add Marker Here"), "contextAddMarker", [this, at] { addMarker(at); });
+        action(tr("Delete All Gaps"), "contextDeleteGaps", [this] { deleteAllGaps(); });
+        m->addSeparator();
+        action(tr("Add Video Track"), "contextAddVideoTrack", [this] { addTrack(ve::TrackKind::Video); });
+        action(tr("Add Audio Track"), "contextAddAudioTrack", [this] { addTrack(ve::TrackKind::Audio); });
+        break;
+    }
+    }
+    return menu;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Layouts
+// ---------------------------------------------------------------------------------------------
+
+bool MainWindow::saveLayoutPreset(const QString& name)
+{
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty())
+        return false;
+    auto settings = layoutSettings();
+    settings->setValue(QStringLiteral("presets/") + presetKey(trimmed), saveState(kLayoutVersion));
+    settings->sync();
+    return settings->status() == QSettings::NoError;
+}
+
+bool MainWindow::loadLayoutPreset(const QString& name)
+{
+    auto settings = layoutSettings();
+    const QByteArray state = settings->value(QStringLiteral("presets/") + presetKey(name.trimmed())).toByteArray();
+    if (state.isEmpty() || !restoreState(state, kLayoutVersion))
+        return false;
+    if (m_sourceDock->isHidden())
+        setActiveViewer(false);
+    return true;
+}
+
+bool MainWindow::deleteLayoutPreset(const QString& name)
+{
+    auto settings = layoutSettings();
+    const QString key = QStringLiteral("presets/") + presetKey(name.trimmed());
+    if (!settings->contains(key))
+        return false;
+    settings->remove(key);
+    return true;
+}
+
+QStringList MainWindow::layoutPresets() const
+{
+    auto settings = layoutSettings();
+    settings->beginGroup(QStringLiteral("presets"));
+    QStringList names;
+    for (const QString& key : settings->childKeys())
+        names << presetName(key);
+    names.sort(Qt::CaseInsensitive);
+    return names;
+}
+
+void MainWindow::resetLayout()
+{
+    applyDefaultLayout();
+    sizeDefaultDocks();
+}
+
+void MainWindow::restoreLastLayout()
+{
+    auto settings = layoutSettings();
+    const QByteArray geometry = settings->value(QStringLiteral("last/geometry")).toByteArray();
+    const QByteArray state = settings->value(QStringLiteral("last/state")).toByteArray();
+    if (!geometry.isEmpty())
+        restoreGeometry(geometry);
+    if (!state.isEmpty() && restoreState(state, kLayoutVersion))
+        m_sizeDocksOnShow = false;
+}
+
+void MainWindow::refreshPresetsMenu()
+{
+    m_presetsMenu->clear();
+    m_presetsMenu->addAction(tr("Save Current Layout As..."), this, [this] {
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, tr("Save Layout"), tr("Preset name:"), QLineEdit::Normal, {}, &ok);
+        if (ok && !name.trimmed().isEmpty()) {
+            if (saveLayoutPreset(name))
+                statusBar()->showMessage(tr("Layout \"%1\" saved").arg(name.trimmed()), 3000);
+            else
+                statusBar()->showMessage(tr("Could not save the layout"), 4000);
+        }
+    });
+    const QStringList names = layoutPresets();
+    if (names.isEmpty())
+        return;
+    m_presetsMenu->addSeparator();
+    for (const QString& name : names)
+        m_presetsMenu->addAction(name, this, [this, name] { loadLayoutPreset(name); });
+    m_presetsMenu->addSeparator();
+    QMenu* remove = m_presetsMenu->addMenu(tr("Delete Preset"));
+    for (const QString& name : names)
+        remove->addAction(name, this, [this, name] { deleteLayoutPreset(name); });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Model plumbing
 // ---------------------------------------------------------------------------------------------
 
 void MainWindow::onModelChanged()
 {
+    // Another timeline became current (tab, compound clip, undo of a new timeline...): each
+    // timeline keeps its own playhead.
+    const bool switched = m_project.currentTimeline != m_shownTimeline;
+    const bool firstShown = m_shownTimeline.empty();
+    if (switched && !firstShown)
+        m_playheads[m_shownTimeline] = m_engine->position();
+
     auto snapshot = ve::TimelineSnapshot::fromProject(m_project);
     const bool changed = !m_snapshot || m_snapshot->timeline != snapshot->timeline
         || m_snapshot->nested != snapshot->nested || m_snapshot->media.size() != snapshot->media.size();
@@ -429,8 +1085,88 @@ void MainWindow::onModelChanged()
         m_engine->setTimeline(snapshot);
     }
     m_pool->setMedia(m_project.media, m_project.timeline().rate);
+    // Media that left the pool (undone import, other project) leaves the source viewer too.
+    if (m_source->hasMedia() && !m_project.media.find(m_source->mediaId())) {
+        m_source->setMedia(nullptr, m_project.timeline().rate);
+        setActiveViewer(false);
+    }
     m_timeline->refresh();
+
+    if (switched) {
+        m_shownTimeline = m_project.currentTimeline;
+        if (!firstShown) {
+            m_markIn.reset();
+            m_markOut.reset();
+            m_timeline->clearMarkerSelection();
+            m_timeline->zoomToFit();
+            const auto it = m_playheads.find(m_shownTimeline);
+            seekTo(it != m_playheads.end() ? it->second : Time(0));
+        }
+    }
+    refreshTimelineTabs();
+    // A tab behind another panel stays "visible" off screen; it is refreshed when its tab is picked.
+    if (!m_indexDock->visibleRegion().isEmpty())
+        m_index->setTimeline(m_project.timeline(), m_project.media);
+    refreshPanels();
     updateWindowState();
+}
+
+void MainWindow::refreshPanels()
+{
+    // The inspector shows the last thing picked: a marker, clips, a track header, or else the timeline.
+    const ve::Timeline& tl = m_project.timeline();
+    const ve::Id marker = m_timeline->selectedMarker();
+    if (!marker.empty()) {
+        if (const ve::Marker* m = ve::edit::findMarker(tl, marker)) {
+            m_inspector->showMarker(tl, *m);
+            return;
+        }
+    }
+    const std::vector<ve::Id> clips = selection();
+    if (!clips.empty()) {
+        m_inspector->showClips(tl, m_project.media, clips);
+        return;
+    }
+    if (const ve::Track* track = tl.track(m_timeline->focusedTrack())) {
+        m_inspector->showTrack(tl, *track);
+        return;
+    }
+    m_inspector->showTimeline(tl);
+}
+
+void MainWindow::refreshTimelineTabs()
+{
+    const std::vector<ve::Timeline>& timelines = m_project.timelines;
+    // Timelines a compound clip shows are marked as such.
+    std::set<ve::Id> nested;
+    for (const ve::Timeline& tl : timelines) {
+        for (const ve::Track& t : tl.tracks) {
+            for (const ve::PlacedItem& p : t.clips()) {
+                if (const auto* compound = std::get_if<ve::CompoundClip>(p.item))
+                    nested.insert(compound->timelineId);
+            }
+        }
+    }
+
+    const QSignalBlocker block(m_timelineTabs);
+    bool same = m_timelineTabs->count() == int(timelines.size());
+    for (int i = 0; same && i < m_timelineTabs->count(); ++i)
+        same = m_timelineTabs->tabData(i).toString() == qs(timelines[std::size_t(i)].id)
+            && m_timelineTabs->tabText(i) == qs(timelines[std::size_t(i)].name);
+    if (!same) {
+        while (m_timelineTabs->count() > 0)
+            m_timelineTabs->removeTab(0);
+        for (const ve::Timeline& tl : timelines) {
+            const int index = m_timelineTabs->addTab(qs(tl.name));
+            m_timelineTabs->setTabData(index, qs(tl.id));
+        }
+    }
+    for (int i = 0; i < m_timelineTabs->count(); ++i) {
+        const ve::Timeline& tl = timelines[std::size_t(i)];
+        m_timelineTabs->setTabToolTip(i, nested.count(tl.id) ? tr("%1 (compound clip)").arg(qs(tl.name)) : qs(tl.name));
+        if (tl.id == m_project.currentTimeline)
+            m_timelineTabs->setCurrentIndex(i);
+    }
 }
 
 void MainWindow::updateWindowState()
@@ -446,24 +1182,28 @@ void MainWindow::updateWindowState()
 
     const ve::Timeline& tl = m_project.timeline();
     const bool hasClips = tl.hasClips();
-    const std::vector<ve::Id> selected = m_timeline->selectedClips();
+    const std::vector<ve::Id> selected = selection();
     bool compoundSelected = false;
-    for (const ve::Track& t : tl.tracks) {
-        for (const ve::PlacedItem& p : t.clips())
-            compoundSelected |= std::holds_alternative<ve::CompoundClip>(*p.item)
-                && std::find(selected.begin(), selected.end(), p.clip->id) != selected.end();
+    for (const ve::Id& id : selected) {
+        if (const ve::Item* item = findItem(tl, id))
+            compoundSelected |= std::holds_alternative<ve::CompoundClip>(*item);
     }
     m_splitAction->setEnabled(hasClips);
     m_deleteAction->setEnabled(!selected.empty() || !m_timeline->selectedMarker().empty());
     m_rippleDeleteAction->setEnabled(!selected.empty());
     m_composeAction->setEnabled(!selected.empty());
     m_decomposeAction->setEnabled(compoundSelected);
-    const bool hasSource = !m_pool->sourceMediaId().isEmpty();
+    m_openCompoundAction->setEnabled(compoundSelected);
+    for (QAction* a : m_selectionActions)
+        a->setEnabled(!selected.empty());
+    const bool hasSource = m_source->hasMedia() || !m_pool->sourceMediaId().isEmpty();
     for (QAction* a : m_sourceEditActions)
         a->setEnabled(hasSource);
     m_exportAction->setEnabled(hasClips && !m_exporting);
+    m_linkedSelectionAction->setChecked(m_timeline->linkedSelection());
     m_timeline->setMarks(m_markIn, m_markOut);
 
+    m_viewerTitle->setText(tr("Timeline: %1").arg(qs(tl.name)));
     m_duration->setText(qs(ve::formatTimecode(tl.duration(), tl.rate)));
     m_status->setText(tr("Timeline %1x%2 @ %3 fps    GPU: %4")
                           .arg(tl.width)
@@ -497,6 +1237,7 @@ void MainWindow::tick()
         m_lastPlaying = playing;
         updateTransport();
     }
+    m_source->tick();
 }
 
 bool MainWindow::edit(const QString& name, ve::TimelineEditCommand::Operation op, const char* mergeKey)
@@ -504,9 +1245,48 @@ bool MainWindow::edit(const QString& name, ve::TimelineEditCommand::Operation op
     return m_commands.edit(utf8(name), std::move(op), mergeKey ? mergeKey : "");
 }
 
+bool MainWindow::editProject(const QString& name, ve::ProjectEditCommand::Operation op)
+{
+    return m_commands.editProject(utf8(name), std::move(op));
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event)
+{
+    if (event->type() == QEvent::MouseButtonPress && (watched == m_viewer || watched == m_timeline))
+        setActiveViewer(false);
+    return QMainWindow::eventFilter(watched, event);
+}
+
 // ---------------------------------------------------------------------------------------------
-// Transport
+// Viewers and transport
 // ---------------------------------------------------------------------------------------------
+
+void MainWindow::openInSourceViewer(const QString& mediaId)
+{
+    const ve::MediaItem* media = m_project.media.find(utf8(mediaId));
+    if (!media)
+        return;
+    m_engine->pause();
+    m_source->setMedia(media, m_project.timeline().rate);
+    m_sourceDock->show();
+    m_sourceDock->raise();
+    m_pool->selectMedia(mediaId);
+    setActiveViewer(true);
+}
+
+void MainWindow::setActiveViewer(bool source)
+{
+    m_sourceActive = source && m_source->hasMedia();
+    m_source->setActive(m_sourceActive);
+    // The accent marks the active viewer once there are two to choose from.
+    const bool accent = !m_sourceActive && m_source->hasMedia();
+    if (m_viewerPanel->property("active").toBool() != accent) {
+        m_viewerPanel->setProperty("active", accent);
+        m_viewerPanel->style()->unpolish(m_viewerPanel);
+        m_viewerPanel->style()->polish(m_viewerPanel);
+    }
+    updateWindowState();
+}
 
 void MainWindow::seekTo(Time t)
 {
@@ -530,8 +1310,10 @@ bool MainWindow::isPlaying() const
 
 void MainWindow::play()
 {
-    if (m_project.timeline().hasClips())
+    if (m_project.timeline().hasClips()) {
+        m_source->pause();
         m_engine->play();
+    }
 }
 
 void MainWindow::togglePlay()
@@ -550,15 +1332,78 @@ void MainWindow::stepFrames(std::int64_t frames)
     seekToFrame(ve::frameAt(m_engine->position(), rate) + frames);
 }
 
+void MainWindow::transportToggle()
+{
+    if (!m_sourceActive) {
+        togglePlay();
+        return;
+    }
+    m_engine->pause();
+    m_source->togglePlay();
+}
+
+void MainWindow::transportPlay()
+{
+    if (!m_sourceActive) {
+        play();
+        return;
+    }
+    m_engine->pause();
+    m_source->play();
+}
+
+void MainWindow::transportPause()
+{
+    m_engine->pause();
+    m_source->pause();
+}
+
+void MainWindow::transportStep(std::int64_t frames)
+{
+    if (m_sourceActive)
+        m_source->stepFrames(frames);
+    else
+        stepFrames(frames);
+}
+
+void MainWindow::transportToStart()
+{
+    if (m_sourceActive)
+        m_source->goToStart();
+    else
+        seekTo(Time(0));
+}
+
+void MainWindow::transportToEnd()
+{
+    if (m_sourceActive)
+        m_source->goToEnd();
+    else
+        seekToFrame(ve::frameAt(m_project.timeline().duration(), m_project.timeline().rate) - 1);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Editing
 // ---------------------------------------------------------------------------------------------
 
+bool MainWindow::linkedSelection() const
+{
+    return m_timeline->linkedSelection();
+}
+
+std::vector<ve::Id> MainWindow::selection() const
+{
+    return m_timeline->selectedClips();
+}
+
 void MainWindow::splitAtPlayhead()
 {
     const Time t = m_engine->position();
-    const std::vector<ve::Id> selected = m_timeline->selectedClips();
-    if (!edit(tr("Split"), [t, selected](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::splitAt(tl, t, selected); }))
+    const std::vector<ve::Id> selected = selection();
+    const bool linked = linkedSelection();
+    if (!edit(tr("Split"), [t, selected, linked](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::splitAt(tl, t, selected, linked);
+        }))
         statusBar()->showMessage(tr("Nothing to split under the playhead"), 3000);
 }
 
@@ -570,18 +1415,24 @@ void MainWindow::deleteSelection()
         edit(tr("Delete Marker"), [marker](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::removeMarker(tl, marker); });
         return;
     }
-    const std::vector<ve::Id> selected = m_timeline->selectedClips();
+    const std::vector<ve::Id> selected = selection();
     if (selected.empty())
         return;
-    edit(tr("Delete"), [selected](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::deleteClips(tl, selected); });
+    const bool linked = linkedSelection();
+    edit(tr("Delete"), [selected, linked](ve::Timeline& tl, const ve::MediaPool&) {
+        return ve::edit::deleteClips(tl, selected, linked);
+    });
 }
 
 void MainWindow::rippleDeleteSelection()
 {
-    const std::vector<ve::Id> selected = m_timeline->selectedClips();
+    const std::vector<ve::Id> selected = selection();
     if (selected.empty())
         return;
-    if (!edit(tr("Ripple Delete"), [selected](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::rippleDelete(tl, selected); }))
+    const bool linked = linkedSelection();
+    if (!edit(tr("Ripple Delete"), [selected, linked](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::rippleDelete(tl, selected, linked);
+        }))
         statusBar()->showMessage(tr("Ripple delete refused: a sync-locked track has other clips in that time. "
                                     "Turn off its sync lock (or lock it) to leave it as it is."),
                                  6000);
@@ -626,14 +1477,22 @@ void MainWindow::placeMediaAt(const QString& mediaId, std::optional<Time> at, co
 
 void MainWindow::sourceEdit(SourceEdit kind)
 {
-    const ve::MediaItem* found = m_project.media.find(utf8(m_pool->sourceMediaId()));
+    // The source is the source viewer's clip with its In/Out; with an empty viewer, the media
+    // selected in the pool (all of it).
+    const bool fromViewer = m_source->hasMedia();
+    const ve::MediaItem* found = m_project.media.find(fromViewer ? m_source->mediaId() : utf8(m_pool->sourceMediaId()));
     if (!found) {
-        statusBar()->showMessage(tr("Select the media to edit in the media pool first"), 4000);
+        statusBar()->showMessage(tr("Open the media in the source viewer (double-click it in the pool) or select it there first"),
+                                 4000);
         return;
     }
     const ve::MediaItem media = *found;
     ve::edit::EditPoints p;
     p.mediaId = media.id;
+    if (fromViewer) {
+        p.sourceIn = m_source->sourceIn();
+        p.sourceOut = m_source->sourceOut();
+    }
     p.playhead = m_engine->position();
     p.recordIn = m_markIn;
     p.recordOut = m_markOut;
@@ -648,6 +1507,8 @@ void MainWindow::sourceEdit(SourceEdit kind)
     case SourceEdit::Replace: name = tr("Replace with %1"); break;
     case SourceEdit::FitToFill: name = tr("Fit to Fill %1"); break;
     case SourceEdit::PlaceOnTop: name = tr("Place %1 on Top"); break;
+    case SourceEdit::Append: name = tr("Append %1"); break;
+    case SourceEdit::RippleOverwrite: name = tr("Ripple Overwrite with %1"); break;
     }
     auto end = std::make_shared<std::optional<Time>>(); // where the new clips end, for the playhead
     const bool ok = edit(name.arg(qs(media.name)), [media, p, kind, conform, end](ve::Timeline& tl, const ve::MediaPool& pool) {
@@ -660,6 +1521,8 @@ void MainWindow::sourceEdit(SourceEdit kind)
         case SourceEdit::Replace: ids = ve::edit::replaceEdit(tl, pool, p); break;
         case SourceEdit::FitToFill: ids = ve::edit::fitToFillEdit(tl, pool, p); break;
         case SourceEdit::PlaceOnTop: ids = ve::edit::placeOnTopEdit(tl, pool, p); break;
+        case SourceEdit::Append: ids = ve::edit::appendEdit(tl, pool, p); break;
+        case SourceEdit::RippleOverwrite: ids = ve::edit::rippleOverwriteEdit(tl, pool, p); break;
         }
         if (!ids.empty()) {
             if (auto loc = tl.locateClip(ids.front()))
@@ -668,30 +1531,34 @@ void MainWindow::sourceEdit(SourceEdit kind)
         return !ids.empty();
     });
     if (!ok) {
-        statusBar()->showMessage(kind == SourceEdit::FitToFill
-                                     ? tr("Fit to fill needs a timeline Out point (O) and a free destination track")
-                                 : kind == SourceEdit::Replace
-                                     ? tr("Replace needs a clip under the playhead on a destination track, and enough media")
-                                     : tr("Edit refused: check the In/Out points, the media length and the destination tracks "
-                                          "(locked ones cannot be edited)"),
-                                 6000);
+        QString why;
+        switch (kind) {
+        case SourceEdit::FitToFill: why = tr("Fit to fill needs a timeline Out point (O) and a free destination track"); break;
+        case SourceEdit::Replace:
+            why = tr("Replace needs a clip under the playhead on a destination track, and enough media");
+            break;
+        case SourceEdit::RippleOverwrite:
+            why = tr("Ripple overwrite needs a clip under the playhead (or the In) on a destination track, and the "
+                     "sync-locked tracks free to ripple");
+            break;
+        default:
+            why = tr("Edit refused: check the In/Out points, the media length and the destination tracks "
+                     "(locked ones cannot be edited)");
+            break;
+        }
+        statusBar()->showMessage(why, 6000);
         return;
     }
-    clearMarks();
+    clearTimelineMarks();
     if (conform)
         m_timeline->zoomToFit();
     if (*end && kind != SourceEdit::Replace)
         seekTo(**end); // like other editors, the playhead moves past the new clip
 }
 
-bool MainWindow::editProject(const QString& name, ve::ProjectEditCommand::Operation op)
-{
-    return m_commands.editProject(utf8(name), std::move(op));
-}
-
 void MainWindow::composeSelection()
 {
-    const std::vector<ve::Id> selected = m_timeline->selectedClips();
+    const std::vector<ve::Id> selected = selection();
     if (selected.empty())
         return;
     if (!editProject(tr("New Compound Clip"), [selected](ve::Project& p) { return ve::edit::composeClips(p, selected).has_value(); }))
@@ -700,7 +1567,7 @@ void MainWindow::composeSelection()
 
 void MainWindow::decomposeSelection()
 {
-    for (const ve::Id& id : m_timeline->selectedClips()) {
+    for (const ve::Id& id : selection()) {
         auto loc = m_project.timeline().locateClip(id);
         if (loc && std::holds_alternative<ve::CompoundClip>(loc->item)) {
             if (!editProject(tr("Decompose Compound Clip"), [id](ve::Project& p) { return ve::edit::decomposeClip(p, id); }))
@@ -708,6 +1575,13 @@ void MainWindow::decomposeSelection()
             return;
         }
     }
+}
+
+void MainWindow::openCompound(const QString& clipId)
+{
+    const ve::Item* item = findItem(m_project.timeline(), utf8(clipId));
+    if (const auto* compound = item ? std::get_if<ve::CompoundClip>(item) : nullptr)
+        openTimeline(compound->timelineId);
 }
 
 void MainWindow::addTrack(ve::TrackKind kind)
@@ -718,6 +1592,10 @@ void MainWindow::addTrack(ve::TrackKind kind)
 
 void MainWindow::markIn()
 {
+    if (m_sourceActive) {
+        m_source->markIn();
+        return;
+    }
     m_markIn = ve::floorToFrame(m_engine->position(), m_project.timeline().rate);
     if (m_markOut && *m_markOut <= *m_markIn)
         m_markOut.reset();
@@ -726,6 +1604,10 @@ void MainWindow::markIn()
 
 void MainWindow::markOut()
 {
+    if (m_sourceActive) {
+        m_source->markOut();
+        return;
+    }
     // The Out includes the frame under the playhead.
     const ve::Rate rate = m_project.timeline().rate;
     m_markOut = ve::timeOfFrame(ve::frameAt(m_engine->position(), rate) + 1, rate);
@@ -736,17 +1618,25 @@ void MainWindow::markOut()
 
 void MainWindow::clearMarks()
 {
+    if (m_sourceActive)
+        m_source->clearMarks();
+    else
+        clearTimelineMarks();
+}
+
+void MainWindow::clearTimelineMarks()
+{
     m_markIn.reset();
     m_markOut.reset();
     updateWindowState();
 }
 
-void MainWindow::addMarker()
+void MainWindow::addMarker(std::optional<Time> at)
 {
-    const Time at = m_engine->position();
+    const Time where = at.value_or(m_engine->position());
     const QString name = tr("Marker %1").arg(m_project.timeline().markers.size() + 1);
-    if (!edit(tr("Add Marker"), [at, name](ve::Timeline& tl, const ve::MediaPool&) {
-            return !ve::edit::addMarker(tl, at, utf8(name)).empty();
+    if (!edit(tr("Add Marker"), [where, name](ve::Timeline& tl, const ve::MediaPool&) {
+            return !ve::edit::addMarker(tl, where, utf8(name)).empty();
         }))
         statusBar()->showMessage(tr("There is already a marker on this frame"), 3000);
 }
@@ -786,6 +1676,170 @@ void MainWindow::jumpToMarker(int direction)
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Organization, gaps and timelines (phase 3)
+// ---------------------------------------------------------------------------------------------
+
+void MainWindow::setSelectionColor(const QString& color)
+{
+    const std::vector<ve::Id> selected = selection();
+    edit(tr("Clip Color"), [selected, color](ve::Timeline& tl, const ve::MediaPool&) {
+        return ve::edit::setClipColor(tl, selected, utf8(color));
+    });
+}
+
+void MainWindow::setSelectionFlag(const QString& color, bool on)
+{
+    const std::vector<ve::Id> selected = selection();
+    edit(on ? tr("Add Flag") : tr("Remove Flag"), [selected, color, on](ve::Timeline& tl, const ve::MediaPool&) {
+        return ve::edit::setClipFlag(tl, selected, utf8(color), on);
+    });
+}
+
+void MainWindow::clearSelectionFlags()
+{
+    const std::vector<ve::Id> selected = selection();
+    edit(tr("Clear Flags"), [selected](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::clearClipFlags(tl, selected); });
+}
+
+void MainWindow::toggleSelectionEnabled()
+{
+    // Any enabled clip in the selection: disable them all; otherwise enable them.
+    const std::vector<ve::Id> selected = selection();
+    bool anyEnabled = false;
+    for (const ve::Id& id : selected) {
+        if (const ve::ClipBase* c = findClipBase(m_project.timeline(), id))
+            anyEnabled |= c->enabled;
+    }
+    const bool on = !anyEnabled;
+    edit(on ? tr("Enable Clip") : tr("Disable Clip"),
+         [selected, on](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::setClipsEnabled(tl, selected, on); });
+}
+
+void MainWindow::linkSelection()
+{
+    const std::vector<ve::Id> selected = selection();
+    if (!edit(tr("Link Clips"), [selected](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::linkClips(tl, selected); }))
+        statusBar()->showMessage(tr("Select clips on different tracks (one per track) to link them"), 4000);
+}
+
+void MainWindow::unlinkSelection()
+{
+    const std::vector<ve::Id> selected = selection();
+    edit(tr("Unlink Clips"), [selected](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::unlinkClips(tl, selected); });
+}
+
+void MainWindow::swapSelection(int direction)
+{
+    const std::vector<ve::Id> selected = selection();
+    if (selected.empty())
+        return;
+    const ve::Id clip = selected.front();
+    if (!edit(direction < 0 ? tr("Swap with Previous Clip") : tr("Swap with Next Clip"),
+              [clip, direction](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::swapClips(tl, clip, direction); }))
+        statusBar()->showMessage(tr("Cannot swap: no clip there, or its linked partners do not line up"), 4000);
+}
+
+void MainWindow::insertGapAtPlayhead()
+{
+    // The In->Out range when both are set, otherwise one second at the playhead.
+    const ve::Rate rate = m_project.timeline().rate;
+    Time at = ve::floorToFrame(m_engine->position(), rate);
+    Time length = ve::timeOfFrame(std::llround(rate.toDouble()), rate);
+    if (m_markIn && m_markOut) {
+        at = *m_markIn;
+        length = *m_markOut - *m_markIn;
+    }
+    if (!edit(tr("Insert Gap"), [at, length](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::insertGap(tl, at, length); }))
+        statusBar()->showMessage(tr("Nothing to move: no unlocked sync-locked track has clips after that point"), 4000);
+}
+
+void MainWindow::deleteGapAt(const QString& trackId, Time at)
+{
+    const ve::Id track = utf8(trackId);
+    if (!edit(tr("Delete Gap"), [track, at](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::deleteGap(tl, track, at); }))
+        statusBar()->showMessage(tr("Cannot close that gap: another sync-locked track has clips in that time"), 5000);
+}
+
+void MainWindow::deleteAllGaps()
+{
+    if (!edit(tr("Delete Gaps"), [](ve::Timeline& tl, const ve::MediaPool&) { return ve::edit::deleteGaps(tl); }))
+        statusBar()->showMessage(tr("No gap is empty on every sync-locked track"), 4000);
+}
+
+void MainWindow::openTimeline(const ve::Id& timelineId)
+{
+    // Not an edit: which timeline is open is not undone (each edit remembers its own timeline).
+    if (timelineId == m_project.currentTimeline || !ve::edit::setCurrentTimeline(m_project, timelineId))
+        return;
+    m_engine->pause();
+    onModelChanged();
+}
+
+void MainWindow::newTimeline()
+{
+    editProject(tr("New Timeline"), [](ve::Project& p) { return !ve::edit::newTimeline(p).empty(); });
+}
+
+void MainWindow::duplicateTimeline()
+{
+    const ve::Id id = m_project.currentTimeline;
+    editProject(tr("Duplicate Timeline"), [id](ve::Project& p) { return !ve::edit::duplicateTimeline(p, id).empty(); });
+}
+
+void MainWindow::renameTimeline()
+{
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, tr("Rename Timeline"), tr("Name:"), QLineEdit::Normal,
+                                               qs(m_project.timeline().name), &ok);
+    if (!ok)
+        return;
+    const ve::Id id = m_project.currentTimeline;
+    if (!editProject(tr("Rename Timeline"), [id, name](ve::Project& p) { return ve::edit::renameTimeline(p, id, utf8(name.trimmed())); }))
+        statusBar()->showMessage(tr("Another timeline already has that name"), 4000);
+}
+
+void MainWindow::deleteTimeline()
+{
+    const ve::Id id = m_project.currentTimeline;
+    if (!editProject(tr("Delete Timeline"), [id](ve::Project& p) { return ve::edit::deleteTimeline(p, id); }))
+        statusBar()->showMessage(tr("The last timeline, and timelines a compound clip shows, cannot be deleted"), 5000);
+}
+
+void MainWindow::renameTrackInteractive(const QString& trackId)
+{
+    const ve::Track* track = m_project.timeline().track(utf8(trackId));
+    if (!track)
+        return;
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, tr("Rename Track"), tr("Name:"), QLineEdit::Normal, qs(track->name), &ok);
+    if (!ok)
+        return;
+    const ve::Id id = track->id;
+    if (!edit(tr("Rename Track"), [id, name](ve::Timeline& tl, const ve::MediaPool&) {
+            return ve::edit::renameTrack(tl, id, utf8(name.trimmed()));
+        }))
+        statusBar()->showMessage(tr("Another track already has that name"), 4000);
+}
+
+void MainWindow::renameSelectionInteractive()
+{
+    const std::vector<ve::Id> selected = selection();
+    const ve::ClipBase* first = selected.empty() ? nullptr : findClipBase(m_project.timeline(), selected.front());
+    if (!first)
+        return;
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, tr("Rename Clip"), tr("Name:"), QLineEdit::Normal, qs(first->name), &ok);
+    if (!ok)
+        return;
+    edit(tr("Rename Clip"), [selected, name](ve::Timeline& tl, const ve::MediaPool&) {
+        bool changed = false;
+        for (const ve::Id& id : selected)
+            changed |= ve::edit::renameClip(tl, id, utf8(name));
+        return changed;
+    });
 }
 
 void MainWindow::importFiles(const QStringList& paths, std::optional<Time> at)
@@ -861,6 +1915,10 @@ void MainWindow::newProject()
     m_project = ve::makeEmptyProject();
     m_projectPath.clear();
     m_snapshot.reset();
+    m_shownTimeline.clear();
+    m_playheads.clear();
+    m_markIn.reset();
+    m_markOut.reset();
     m_timeline->setProject(&m_project);
     m_commands.clear();
     seekTo(Time(0));
@@ -888,6 +1946,10 @@ bool MainWindow::openProjectFile(const QString& path)
     m_project = std::move(*loaded);
     m_projectPath = QFileInfo(path).absoluteFilePath();
     m_snapshot.reset();
+    m_shownTimeline.clear();
+    m_playheads.clear();
+    m_markIn.reset();
+    m_markOut.reset();
     m_timeline->setProject(&m_project);
     m_commands.clear();
     m_timeline->zoomToFit();
@@ -950,6 +2012,7 @@ void MainWindow::exportTimeline()
     if (m_exporting || !m_project.timeline().hasClips())
         return;
     m_engine->pause();
+    m_source->pause();
 
     const QString suggested = m_projectPath.isEmpty()
         ? QStandardPaths::writableLocation(QStandardPaths::MoviesLocation) + QStringLiteral("/export.mp4")
@@ -1014,6 +2077,15 @@ void MainWindow::onExportFinished(const ve::ExportResult& result, const QString&
     }
 }
 
+void MainWindow::showEvent(QShowEvent* event)
+{
+    QMainWindow::showEvent(event);
+    if (m_sizeDocksOnShow) {
+        m_sizeDocksOnShow = false;
+        sizeDefaultDocks();
+    }
+}
+
 void MainWindow::closeEvent(QCloseEvent* event)
 {
     if (m_exporting) {
@@ -1026,5 +2098,10 @@ void MainWindow::closeEvent(QCloseEvent* event)
         return;
     }
     m_engine->pause();
+    m_source->pause();
+    // The layout is back next time (app/main.cpp calls restoreLastLayout()).
+    auto settings = layoutSettings();
+    settings->setValue(QStringLiteral("last/geometry"), saveGeometry());
+    settings->setValue(QStringLiteral("last/state"), saveState(kLayoutVersion));
     event->accept();
 }

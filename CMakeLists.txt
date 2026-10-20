@@ -121,7 +121,11 @@ if(VE_BUILD_APP)
         ui/ViewerWidget.cpp ui/ViewerWidget.h
         ui/TimelineWidget.cpp ui/TimelineWidget.h
         ui/MediaPoolWidget.cpp ui/MediaPoolWidget.h
-        ui/ExportDialog.cpp ui/ExportDialog.h)
+        ui/ExportDialog.cpp ui/ExportDialog.h
+        ui/LabelColors.cpp ui/LabelColors.h
+        ui/SourceViewerPanel.cpp ui/SourceViewerPanel.h
+        ui/InspectorWidget.cpp ui/InspectorWidget.h
+        ui/EditIndexWidget.cpp ui/EditIndexWidget.h)
     set_target_properties(ve_ui PROPERTIES AUTOMOC ON)
     target_link_libraries(ve_ui PUBLIC ve_engine Qt6::Widgets Qt6::GuiPrivate)
 
@@ -199,6 +203,8 @@ if(VE_BUILD_TESTS)
         tests/core/test_trims.cpp
         tests/core/test_compound.cpp
         tests/core/test_tracks_markers.cpp
+        tests/core/test_organization.cpp
+        tests/core/test_gaps_and_order.cpp
         tests/core/test_golden.cpp
         tests/core/test_commands.cpp
         tests/core/test_project_file.cpp

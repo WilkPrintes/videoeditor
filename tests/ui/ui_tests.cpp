@@ -5,6 +5,12 @@
 // - multitrackTrimsAndMarkers (phase 2): add tracks -> ripple with the trim tool -> cancelled ripple ->
 //   roll (Ctrl) -> L cut (Ctrl+Alt) -> slip -> move to V2 -> marker snapping -> lock from the track
 //   header -> insert from the media pool (F9), each drag one undo step.
+// - panelsLayoutsAndSourceViewer (phase 3): docked panels -> layout preset save/reset/load/delete ->
+//   source viewer from the pool (double-click) as the active viewer, its In/Out and transport ->
+//   overwrite and append of the source range -> timeline tabs, each timeline with its own playhead.
+// - inspectorIndexAndContextMenus (phase 3): rename, colour and disable from the inspector -> colour,
+//   flag and unlink from the clip's context menu -> ripple delete of a gap -> track and marker menus
+//   -> edit index row -> linked selection off -> compound clip opened with a double-click.
 //
 // Uses VE_TEST_MEDIA if set, otherwise generates a clapper clip with the engine's test pattern.
 // VE_UI_SCREENSHOT=<file.png> saves the window after the edits (the phase 2 test adds "_phase2").
@@ -13,9 +19,18 @@
 #include "media/TestPattern.h"
 #include "ui/MainWindow.h"
 #include "ui/MediaPoolWidget.h"
+#include "ui/SourceViewerPanel.h"
 #include "ui/TimelineWidget.h"
 
 #include <QAction>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDockWidget>
+#include <QLineEdit>
+#include <QMenu>
+#include <QStandardPaths>
+#include <QTabBar>
+#include <QTableWidget>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -28,6 +43,8 @@ private slots:
     void initTestCase();
     void editAndPlayThroughTheUi();
     void multitrackTrimsAndMarkers();
+    void panelsLayoutsAndSourceViewer();
+    void inspectorIndexAndContextMenus();
 
 private:
     QTemporaryDir m_dir;
@@ -36,6 +53,9 @@ private:
 
 void UiTests::initTestCase()
 {
+    // Layout presets go to a test location, never to the user's settings.
+    QStandardPaths::setTestModeEnabled(true);
+    QFile::remove(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation) + QStringLiteral("/layouts.ini"));
     m_media = qEnvironmentVariable("VE_TEST_MEDIA");
     if (m_media.isEmpty()) {
         QVERIFY(m_dir.isValid());
@@ -322,6 +342,329 @@ void UiTests::multitrackTrimsAndMarkers()
         path.insert(path.lastIndexOf(QLatin1Char('.')), QStringLiteral("_phase2"));
         w.grab().save(path);
     }
+}
+
+void UiTests::panelsLayoutsAndSourceViewer()
+{
+    MainWindow w;
+    w.resize(1400, 900);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    auto action = [&](const char* name) {
+        auto* a = w.findChild<QAction*>(QLatin1String(name));
+        Q_ASSERT(a);
+        return a;
+    };
+    auto dock = [&](const char* name) {
+        auto* d = w.findChild<QDockWidget*>(QLatin1String(name));
+        Q_ASSERT(d);
+        return d;
+    };
+    auto* timeline = w.findChild<TimelineWidget*>();
+    auto* source = w.findChild<SourceViewerPanel*>();
+    auto* pool = w.findChild<MediaPoolWidget*>();
+    auto* tabs = w.findChild<QTabBar*>(QStringLiteral("timelineTabs"));
+    QVERIFY(timeline && source && pool && tabs);
+    const ve::Rate rate{30, 1};
+    auto frame = [&](std::int64_t n) { return ve::timeOfFrame(n, rate); };
+    auto clipsOn = [&](std::size_t track) { return w.project().timeline().tracks.at(track).clips(); };
+
+    // Default layout: the panels are docked around the timeline viewer, the edit index behind the pool.
+    for (const char* name : {"dockMediaPool", "dockSourceViewer", "dockInspector", "dockTimeline"})
+        QTRY_VERIFY2(dock(name)->isVisible(), name);
+    QVERIFY(!dock("dockEditIndex")->isHidden());
+    QVERIFY(dock("dockEditIndex")->visibleRegion().isEmpty()); // a tab behind the pool
+    QVERIFY(!dock("dockMediaPool")->visibleRegion().isEmpty());
+
+    // A preset remembers which panels are shown and where they are, floating ones included.
+    action("actionShowInspector")->trigger();
+    QVERIFY(dock("dockInspector")->isHidden());
+    dock("dockEditIndex")->setFloating(true);
+    QVERIFY(w.saveLayoutPreset(QStringLiteral("Compact / review")));
+    QVERIFY(w.layoutPresets().contains(QStringLiteral("Compact / review")));
+    action("actionResetLayout")->trigger();
+    QTRY_VERIFY(dock("dockInspector")->isVisible());
+    QVERIFY(!dock("dockEditIndex")->isFloating());
+    QVERIFY(w.loadLayoutPreset(QStringLiteral("Compact / review")));
+    QTRY_VERIFY(dock("dockInspector")->isHidden());
+    QVERIFY(dock("dockEditIndex")->isFloating());
+    QVERIFY(w.deleteLayoutPreset(QStringLiteral("Compact / review")));
+    QVERIFY(!w.layoutPresets().contains(QStringLiteral("Compact / review")));
+    QVERIFY(!w.loadLayoutPreset(QStringLiteral("Compact / review")));
+    action("actionResetLayout")->trigger();
+    QTRY_VERIFY(dock("dockInspector")->isVisible());
+    QVERIFY(!dock("dockEditIndex")->isFloating());
+
+    // A double-click in the pool opens the media in the source viewer, which becomes the active viewer.
+    w.importFiles({m_media});
+    QCOMPARE(clipsOn(0).size(), std::size_t(1));
+    QVERIFY(!w.sourceViewerActive());
+    QTest::qWait(50);
+    const QRect item = pool->visualItemRect(pool->item(0));
+    QTest::mouseClick(pool->viewport(), Qt::LeftButton, {}, item.center()); // QTest's double-click event has no press
+    QTest::mouseDClick(pool->viewport(), Qt::LeftButton, {}, item.center());
+    QTRY_VERIFY(w.sourceViewerActive());
+    QVERIFY(source->hasMedia());
+    QCOMPARE(source->mediaId(), w.project().media.items.front().id);
+
+    // I and O mark the active viewer: the source. Space plays it, not the timeline.
+    source->seek(frame(30));
+    QTRY_COMPARE(source->position(), frame(30));
+    action("actionMarkIn")->trigger();
+    source->seek(frame(89));
+    QTRY_COMPARE(source->position(), frame(89));
+    action("actionMarkOut")->trigger();
+    QCOMPARE(source->sourceIn(), std::optional<Time>(frame(30)));
+    QCOMPARE(source->sourceOut(), std::optional<Time>(frame(90)));
+    action("actionPlayPause")->trigger();
+    QTRY_VERIFY(source->isPlaying());
+    QVERIFY(!w.isPlaying());
+    action("actionPlayPause")->trigger();
+    QTRY_VERIFY(!source->isPlaying());
+    QTest::keyClick(&w, Qt::Key_Home); // the source's start, the timeline stays
+    QTRY_COMPARE(source->position(), Time(0));
+
+    // A click in the timeline makes the timeline viewer active; Q switches back and forth.
+    QTest::mouseClick(timeline, Qt::LeftButton, {}, timeline->clipRect(clipsOn(0)[0].clip->id).center());
+    QVERIFY(!w.sourceViewerActive());
+    action("actionSwitchViewer")->trigger();
+    QVERIFY(w.sourceViewerActive());
+    action("actionSwitchViewer")->trigger();
+    QVERIFY(!w.sourceViewerActive());
+
+    // Overwrite (F10) of the source In -> Out at the timeline playhead. The source marks stay.
+    w.seekTo(frame(60));
+    QTRY_COMPARE(w.playheadPosition(), frame(60));
+    QVERIFY(action("actionOverwrite")->isEnabled());
+    action("actionOverwrite")->trigger();
+    auto v = clipsOn(0);
+    QCOMPARE(v.size(), std::size_t(3));
+    QCOMPARE(v[1].start, frame(60));
+    QCOMPARE(v[1].clip->sourceRange.start, frame(30));
+    QCOMPARE(v[1].clip->sourceRange.duration, frame(60));
+    QCOMPARE(clipsOn(1)[1].clip->sourceRange.start, frame(30));
+    QTRY_COMPARE(w.playheadPosition(), frame(120));
+    QCOMPARE(source->sourceIn(), std::optional<Time>(frame(30)));
+
+    // Append (Shift+F12): the same range after the last clip, wherever the playhead is.
+    w.seekTo(Time(0));
+    QTRY_COMPARE(w.playheadPosition(), Time(0));
+    action("actionAppend")->trigger();
+    QCOMPARE(w.project().timeline().duration(), frame(300));
+    QCOMPARE(clipsOn(0).back().start, frame(240));
+    QTRY_COMPARE(w.playheadPosition(), frame(299)); // past the new clip: here the last frame
+
+    // Timeline tabs: a new timeline becomes current; every timeline keeps its own playhead.
+    QCOMPARE(tabs->count(), 1);
+    const ve::Id first = w.project().currentTimeline;
+    w.seekTo(frame(45));
+    QTRY_COMPARE(w.playheadPosition(), frame(45));
+    action("actionNewTimeline")->trigger();
+    QCOMPARE(w.project().timelines.size(), std::size_t(2));
+    QVERIFY(w.project().currentTimeline != first);
+    QVERIFY(!w.project().timeline().hasClips());
+    QCOMPARE(tabs->count(), 2);
+    QCOMPARE(tabs->currentIndex(), 1);
+    QTRY_COMPARE(w.playheadPosition(), Time(0));
+    QTest::mouseClick(tabs, Qt::LeftButton, {}, tabs->tabRect(0).center());
+    QCOMPARE(w.project().currentTimeline, first);
+    QTRY_COMPARE(w.playheadPosition(), frame(45));
+    QCOMPARE(clipsOn(0).size(), std::size_t(4));
+    action("actionUndo")->trigger(); // New Timeline
+    QCOMPARE(w.project().timelines.size(), std::size_t(1));
+    QCOMPARE(tabs->count(), 1);
+
+    if (const QString shot = qEnvironmentVariable("VE_UI_SCREENSHOT"); !shot.isEmpty()) {
+        timeline->zoomToFit();
+        QTest::qWait(300);
+        QString path = shot;
+        path.insert(path.lastIndexOf(QLatin1Char('.')), QStringLiteral("_phase3"));
+        w.grab().save(path);
+    }
+}
+
+void UiTests::inspectorIndexAndContextMenus()
+{
+    MainWindow w;
+    w.resize(1400, 900);
+    w.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&w));
+    auto action = [&](const char* name) {
+        auto* a = w.findChild<QAction*>(QLatin1String(name));
+        Q_ASSERT(a);
+        return a;
+    };
+    auto undoText = [&] { return action("actionUndo")->text(); };
+    auto* timeline = w.findChild<TimelineWidget*>();
+    auto* tabs = w.findChild<QTabBar*>(QStringLiteral("timelineTabs"));
+    QVERIFY(timeline && tabs);
+    const ve::Rate rate{30, 1};
+    auto frame = [&](std::int64_t n) { return ve::timeOfFrame(n, rate); };
+    auto tl = [&]() -> const ve::Timeline& { return w.project().timeline(); };
+    auto clipsOn = [&](std::size_t track) { return tl().tracks.at(track).clips(); };
+    auto clip = [&](const ve::Id& id) -> const ve::ClipBase& {
+        const ve::ClipBase* found = nullptr;
+        for (const ve::Track& t : tl().tracks) {
+            if (auto placed = t.findClip(id))
+                found = placed->clip;
+        }
+        if (!found)
+            qFatal("no clip %s", id.c_str());
+        return *found;
+    };
+    auto click = [&](const ve::Id& clipId, Qt::KeyboardModifiers modifiers = {}) {
+        QTest::mouseClick(timeline, Qt::LeftButton, modifiers, timeline->clipRect(clipId).center());
+    };
+    auto trigger = [&](const TimelineWidget::Context& context, const char* name) {
+        std::unique_ptr<QMenu> menu = w.contextMenu(context);
+        QVERIFY2(menu, name);
+        auto* a = menu->findChild<QAction*>(QLatin1String(name));
+        QVERIFY2(a, name);
+        a->trigger();
+    };
+    using Kind = TimelineWidget::Context::Kind;
+
+    // Two takes X | Y, picture and sound linked.
+    w.importFiles({m_media});
+    w.seekTo(frame(120));
+    QTRY_COMPARE(w.playheadPosition(), frame(120));
+    action("actionSplit")->trigger();
+    QTest::qWait(50);
+    const ve::Id x = clipsOn(0)[0].clip->id;
+    const ve::Id xSound = clipsOn(1)[0].clip->id;
+    const ve::Id y = clipsOn(0)[1].clip->id;
+    const ve::Id ySound = clipsOn(1)[1].clip->id;
+
+    // Inspector: a click shows the clip; renaming there renames picture and sound of the take.
+    click(x);
+    auto* name = w.findChild<QLineEdit*>(QStringLiteral("inspectorClipName"));
+    QVERIFY(name);
+    QTRY_VERIFY(name->isVisible());
+    name->setFocus();
+    name->selectAll();
+    QTest::keyClicks(name, QStringLiteral("Opening shot")); // letters are typed, not taken as shortcuts
+    QTest::keyClick(name, Qt::Key_Return);
+    QCOMPARE(clip(x).name, std::string("Opening shot"));
+    QCOMPARE(clip(xSound).name, std::string("Opening shot"));
+    QVERIFY(undoText().contains(QStringLiteral("Rename Clip")));
+    auto* color = w.findChild<QComboBox*>(QStringLiteral("inspectorClipColor"));
+    QVERIFY(color);
+    color->setCurrentIndex(color->findData(QStringLiteral("teal")));
+    QCOMPARE(clip(x).color, std::string("teal"));
+    QCOMPARE(clip(xSound).color, std::string("teal"));
+    auto* enabled = w.findChild<QCheckBox*>(QStringLiteral("inspectorClipEnabled"));
+    QVERIFY(enabled && enabled->isChecked());
+    enabled->click();
+    QVERIFY(!clip(x).enabled);
+    action("actionEnableClip")->trigger(); // D toggles it back
+    QVERIFY(clip(x).enabled);
+
+    // The clip's context menu: colour, flag, unlink (and undo of each).
+    click(y);
+    TimelineWidget::Context ctx;
+    ctx.kind = Kind::Clip;
+    ctx.clipId = QString::fromStdString(y);
+    trigger(ctx, "contextClipColor:orange");
+    QCOMPARE(clip(y).color, std::string("orange"));
+    QCOMPARE(clip(ySound).color, std::string("orange"));
+    trigger(ctx, "contextFlag:red");
+    QCOMPARE(clip(y).flags, std::vector<std::string>{"red"});
+    trigger(ctx, "contextFlag:red"); // checked now: removes it
+    QVERIFY(clip(y).flags.empty());
+    trigger(ctx, "contextLinkClips");
+    QVERIFY(clip(y).linkGroup.empty());
+    QVERIFY(clip(ySound).linkGroup.empty());
+    action("actionUndo")->trigger();
+    QVERIFY(!clip(y).linkGroup.empty());
+    QCOMPARE(clip(y).linkGroup, clip(ySound).linkGroup);
+
+    // A gap: lift X, then ripple delete the gap from its context menu (sound follows: sync lock).
+    click(x);
+    action("actionDelete")->trigger();
+    QCOMPARE(clipsOn(0).size(), std::size_t(1));
+    ctx = {};
+    ctx.kind = Kind::Gap;
+    ctx.trackId = QString::fromStdString(tl().tracks[0].id);
+    ctx.at = frame(60);
+    trigger(ctx, "contextDeleteGap");
+    QCOMPARE(clipsOn(0)[0].start, Time(0));
+    QCOMPARE(clipsOn(1)[0].start, Time(0));
+    QCOMPARE(tl().duration(), frame(120));
+    action("actionUndo")->trigger();
+    action("actionUndo")->trigger();
+    QCOMPARE(clipsOn(0).size(), std::size_t(2));
+    QCOMPARE(clipsOn(0)[1].start, frame(120));
+
+    // Track header and marker menus.
+    ctx = {};
+    ctx.kind = Kind::TrackHeader;
+    ctx.trackId = QString::fromStdString(tl().tracks[1].id);
+    trigger(ctx, "contextEnableTrack");
+    QVERIFY(!tl().tracks[1].enabled);
+    trigger(ctx, "contextTrackColor:navy");
+    QCOMPARE(tl().tracks[1].color, std::string("navy"));
+    w.seekTo(frame(30));
+    QTRY_COMPARE(w.playheadPosition(), frame(30));
+    action("actionAddMarker")->trigger();
+    ctx = {};
+    ctx.kind = Kind::Marker;
+    ctx.markerId = QString::fromStdString(tl().markers.at(0).id);
+    trigger(ctx, "contextMarkerColor:red");
+    QCOMPARE(tl().markers[0].color, std::string("red"));
+    ctx = {};
+    ctx.kind = Kind::Ruler;
+    ctx.at = frame(200);
+    trigger(ctx, "contextAddMarker");
+    QCOMPARE(tl().markers.size(), std::size_t(2));
+    QCOMPARE(tl().markers[1].start, frame(200));
+
+    // Edit index: one row per clip; a click selects that clip and moves the playhead to it.
+    auto* indexDock = w.findChild<QDockWidget*>(QStringLiteral("dockEditIndex"));
+    indexDock->raise();
+    QTRY_VERIFY(!indexDock->visibleRegion().isEmpty());
+    auto* edits = w.findChild<QTableWidget*>(QStringLiteral("editIndexEdits"));
+    QVERIFY(edits);
+    QTRY_COMPARE(edits->rowCount(), 4);
+    int row = -1;
+    for (int r = 0; r < edits->rowCount(); ++r) {
+        if (edits->item(r, 0)->data(Qt::UserRole).toString().toStdString() == y)
+            row = r;
+    }
+    QVERIFY(row >= 0);
+    QTest::mouseClick(edits->viewport(), Qt::LeftButton, {}, edits->visualItemRect(edits->item(row, 2)).center());
+    const std::vector<ve::Id> selected = timeline->selectedClips();
+    QVERIFY(std::find(selected.begin(), selected.end(), y) != selected.end());
+    QTRY_COMPARE(w.playheadPosition(), frame(120));
+
+    // Linked selection off: a click takes only the picture, Delete leaves the sound.
+    action("actionLinkedSelection")->trigger();
+    QVERIFY(!timeline->linkedSelection());
+    click(x);
+    QCOMPARE(timeline->selectedClips(), std::vector<ve::Id>{x});
+    action("actionDelete")->trigger();
+    QCOMPARE(clipsOn(0).size(), std::size_t(1));
+    QCOMPARE(clipsOn(1).size(), std::size_t(2));
+    action("actionUndo")->trigger();
+    action("actionLinkedSelection")->trigger();
+    QVERIFY(timeline->linkedSelection());
+
+    // A compound clip opens in its own tab with a double-click; the first tab goes back.
+    click(x);
+    action("actionCompose")->trigger();
+    const ve::Id parent = w.project().currentTimeline;
+    QCOMPARE(w.project().timelines.size(), std::size_t(2));
+    const ve::Id compound = clipsOn(0)[0].clip->id;
+    QVERIFY(std::holds_alternative<ve::CompoundClip>(*clipsOn(0)[0].item));
+    QTest::qWait(50);
+    QTest::mouseDClick(timeline, Qt::LeftButton, {}, timeline->clipRect(compound).center());
+    QVERIFY(w.project().currentTimeline != parent);
+    QCOMPARE(tabs->count(), 2);
+    QCOMPARE(tabs->currentIndex(), 1);
+    QCOMPARE(clipsOn(0).size(), std::size_t(1)); // X inside
+    QTest::mouseClick(tabs, Qt::LeftButton, {}, tabs->tabRect(0).center());
+    QCOMPARE(w.project().currentTimeline, parent);
+    QVERIFY(ve::edit::checkInvariants(tl(), w.project().media).empty());
+    QVERIFY(ve::edit::checkSync(tl()).empty());
 }
 
 QTEST_MAIN(UiTests)

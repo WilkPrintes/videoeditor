@@ -238,16 +238,34 @@ para cada trilha de vídeo (de baixo para cima):
 
 ## 12. Fases (cada uma termina com algo que roda)
 
-| Fase | Entrega | Prova de que funciona |
+A sequência foi revista depois da análise do pacote do DaVinci Resolve 21.1.1 (§15). A página Edit
+completa e a interface vêm antes de movimento, cor e áudio, porque todas essas fases precisam dos
+painéis (inspector, viewer de fonte, biblioteca de efeitos) para ter onde morar.
+
+| Fase | Entrega | Prova de que funciona | Situação |
+|---|---|---|---|
+| 0. Fundação | CMake, Qt 6, FFmpeg, RHI, CI local, testes do core | App abre; `ctest` passa | ✅ |
+| 1. Reproduzir e exportar | Importar, media pool, timeline V1/A1, reprodução sincronizada, exportar H.264 | Teste da claquete: A/V sincronizados; frame N decodificado exato | ✅ |
+| 2. Editor de verdade | Multitrilha, todas as edições do §6.1–6.3, desfazer/transações, snapping, marcadores | Estados dourados + teste de propriedade com 10 mil trims | ✅ |
+| 3. Página Edit completa e interface | Painéis acopláveis e presets de layout, viewer de fonte com In/Out, inspector, edit index, organização (cores, flags, nomes, notas), link/unlink, edições que faltam, várias timelines, menus de contexto, trim por teclado, atalhos personalizáveis (§12.1) | Dourados e propriedade das novas edições; teste de GUI de cada painel; layout salvo e restaurado | em andamento |
+| 4. Movimento, tempo e composição | Grafo de render na GPU compartilhado por viewer e exportação; keyframes e editor de curvas; transições; transformar, recortar, opacidade e modos de composição; títulos e geradores; velocidade e rampas; mistura de frames | Hashes de render determinísticos; frame do viewer igual ao exportado | |
+| 5. Cor | Página Color: grafo de nós na GPU, scopes, LUT, qualificador, janelas, gallery | Igualdade numérica com o ColorNode nos mesmos parâmetros | |
+| 6. Áudio | Áudio da Edit (waveforms, fades, crossfades, volume com keyframes, time-stretch) e página Fairlight (mixer, barramentos, automação, EQ/compressor, loudness, gravação) | Medições do §9 | |
+| 7. Mídia, Cut e entrega | Barra de páginas; página Media (navegador de discos, bins e smart bins, metadados, sincronia de áudio, detecção de cena); página Cut (viewer único, timeline dupla, smart insert, source tape); página Deliver (fila de render, presets, ProRes/DNxHR/HEVC, exportar timeline em OTIO/EDL/FCPXML) | Teste de GUI de cada página; render da fila igual ao export direto | |
+| 8. Desempenho | Proxies, cache de frames, render cache, decodificação por hardware sem cópia, render em segundo plano | 4K HEVC em tempo real; scrubbing fluido | |
+| 9. Avançado | Multicam com sincronia por áudio, take selectors, legendas, transcrição, fluxo óptico, estabilização, tracking | Testes sintéticos do §6.4, §6.5 e §10 | |
+| 10. Composição por nós (opcional) | Editor de nós no estilo da página Fusion: merge, transform, máscaras, keyers, tracker | Hashes de render; composição por nós igual à da timeline nos casos simples | |
+
+### 12.1 Fase 3 em passos
+
+| Passo | Entrega | Situação |
 |---|---|---|
-| 0. Fundação | CMake, Qt 6, FFmpeg, RHI, CI local, testes do core | App abre; `ctest` passa |
-| 1. Reproduzir e exportar | Importar, media pool, timeline V1/A1, reprodução sincronizada, exportar H.264 | Teste da claquete: A/V sincronizados; frame N decodificado exato |
-| 2. Editor de verdade | Multitrilha, todas as edições do §6.1–6.3, desfazer/transações, snapping, marcadores | Estados dourados + teste de propriedade com 10 mil trims |
-| 3. Movimento e tempo | Keyframes, transições, transformação, títulos, velocidade e rampas, mistura de frames | Hashes de render determinísticos |
-| 4. Cor | Grafo de nós na GPU, scopes, LUT, qualificador, janelas | Igualdade numérica com o ColorNode nos mesmos parâmetros |
-| 5. Áudio | Mixer, barramentos, automação, EQ/compressor, loudness, formas de onda | Medições do §9 |
-| 6. Desempenho | Proxies, cache de frames, render cache, decodificação por hardware, fila de render | 4K HEVC em tempo real; scrubbing fluido |
-| 7. Avançado | Multicam com sincronia por áudio, fluxo óptico, estabilização, tracking, transcrição, OTIO | Testes sintéticos do §6.4, §6.5 e §10 |
+| 3.1 Organização no core | Cores de clipe e de trilha, flags, renomear clipe e trilha, ativar/desativar clipe, editar marcador (nome, nota, cor, duração), link/unlink, edição só da trilha clicada (linked selection desligado) | ✅ |
+| 3.2 Edições que faltam | Append, ripple overwrite, inserir gap, apagar gaps, trocar clipes de lugar (swap), várias timelines (nova, duplicar, trocar, abrir a timeline de um composto) | ✅ |
+| 3.3 Painéis | Janela com painéis acopláveis (media pool, viewer de fonte, viewer da timeline, inspector, edit index, timeline): mostrar e esconder, destacar para outro monitor, presets de layout salvos, layout restaurado ao abrir | ✅ |
+| 3.4 Viewer de fonte | Mídia do pool num viewer próprio com transporte e In/Out; o viewer ativo recebe o transporte e as marcas; edições de 3 e 4 pontos usam o In/Out da fonte | ✅ |
+| 3.5 Inspector, edit index e menus | Propriedades do clipe, da trilha e do marcador no inspector; lista de edições e de marcadores; menus de contexto no clipe, no cabeçalho e no ruler | ✅ |
+| 3.6 Trim por teclado e atalhos | Selecionar pontos de edição, nudge de 1 frame, trim por timecode digitado, trim dinâmico com JKL, editor de trim, mapa de atalhos personalizável | |
 
 ---
 
@@ -259,7 +277,7 @@ para cada trilha de vídeo (de baixo para cima):
 | Desempenho da GPU entre D3D e Metal | QRhi + compute shaders; medir desde a fase 1 (orçamento de ms por frame) |
 | Complexidade das regras de trim | Core puro com testes de propriedade antes da UI |
 | Áudio em tempo real | Thread isolada sem alocação; medir dropouts automaticamente |
-| Escopo enorme | Fases com entregas executáveis; nada de IA antes da fase 7 |
+| Escopo enorme | Fases com entregas executáveis; nada de IA antes da fase 9 |
 
 ---
 
@@ -268,7 +286,7 @@ para cada trilha de vídeo (de baixo para cima):
 | Observado (nome interno) | Equivalente no caso de estudo |
 |---|---|
 | `Sm2Timeline`, `Sm2TiTrack`, `Sm2TiVideoClip`, `Sm2TimeMap` | `core::Timeline`, `Track`, `Clip`, `TimeMap` |
-| `Sm2MpCompoundClip`, `Sm2MpMulticamClip`, `Sm2MpFusionClip` | `CompoundClip`, `MulticamClip` (sem Fusion) |
+| `Sm2MpCompoundClip`, `Sm2MpMulticamClip`, `Sm2MpFusionClip` | `CompoundClip`, `MulticamClip`; composição por nós na fase 10 (opcional) |
 | `*Act*` + `FLActCreateTransaction/Commit/Abort` | `Command` + `Transaction` |
 | `GsManager`/`GsTask*Planner`, filas High/Low | `engine::Planner` + filas de prioridade |
 | `ReactorGPU` + `DVIP::*Imp<API, float \| half>` | `gpu::GraphExecutor` + shaders com variantes |
@@ -279,3 +297,32 @@ para cada trilha de vídeo (de baixo para cima):
 | `DVIP::SpeechRecognition` (Kaldi) | whisper.cpp |
 | SQLite/PostgreSQL com blobs protobuf | SQLite com JSON/blobs |
 | `opentimelineio` | OpenTimelineIO |
+| `UiPanelLayoutBase` + um layout por página (`UiBrowse/FirstCut/Conformer/Color/Audio/Deliver/PhotoPanelLayout`) | Painéis acopláveis na fase 3; barra de páginas na fase 7 |
+
+---
+
+## 15. Lacunas em relação ao Resolve 21.1.1
+
+Levantamento estático do pacote para Mac, sem executar nada:
+- inventário do `.app` pelo REA (`inspect_artifact`, 4 604 arquivos);
+- sumário do manual de referência que vem dentro do app (4 351 páginas, 14 menus com cerca de 330
+  comandos);
+- nomes de classe da interface no binário (2 226 `Ui*`).
+
+O que o editor ainda não tem, e em que fase entra:
+
+| Área do Resolve | O que falta aqui | Fase |
+|---|---|---|
+| Layout | Painéis acopláveis, mostrar/esconder, presets de layout, monitor duplo, menus de contexto, atalhos personalizáveis | 3 |
+| Edit: painéis | Viewer de fonte com In/Out, inspector, edit index, metadados | 3 |
+| Edit: organização | Flags, cores de clipe e de trilha, nomes de trilha, notas nos marcadores, link/unlink, linked selection | 3 |
+| Edit: edições | Append, ripple overwrite, inserir e apagar gaps, swap, seleção de intervalo, editor de trim, trim JKL e por timecode | 3 |
+| Edit: timelines | Várias timelines em abas, duplicar, backups, abrir a timeline de um composto | 3 |
+| Edit: efeitos | Biblioteca de efeitos, transições, títulos, geradores, transformar e recortar, composição, velocidade, keyframes e curvas | 4 |
+| Color | Página inteira: paletas, nós, gallery, scopes, LUTs, Resolve FX | 5 |
+| Áudio | Waveforms, fades, crossfades, mixer e medidores na Edit; página Fairlight | 6 |
+| Media, Cut, Deliver | As três páginas e a barra de páginas | 7 |
+| Desempenho | Proxies, render cache, render em segundo plano | 8 |
+| Avançado | Multicam, take selectors, legendas, transcrição, IA | 9 |
+| Fusion | Composição por nós (36 categorias, cerca de 300 nós no Resolve) | 10, opcional |
+| Fora do escopo | Photo, Blackmagic Cloud e colaboração, painéis de hardware, scripting, OFX | — |

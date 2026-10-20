@@ -3,10 +3,12 @@
 #include "core/Commands.h"
 #include "core/Model.h"
 #include "core/Snapshot.h"
+#include "ui/TimelineWidget.h"
 
 #include <QMainWindow>
 #include <QTimer>
 
+#include <map>
 #include <memory>
 #include <optional>
 
@@ -15,16 +17,28 @@ class PlaybackEngine;
 struct ExportResult;
 }
 
+class EditIndexWidget;
+class InspectorWidget;
 class MediaPoolWidget;
 class QAction;
+class QDockWidget;
+class QFrame;
 class QLabel;
+class QMenu;
+class QTabBar;
 class QToolButton;
-class TimelineWidget;
+class SourceViewerPanel;
 class ViewerWidget;
 
-// Owns the project, the command stack and the playback engine, and turns UI gestures into
+// Owns the project, the command stack and the playback engines, and turns UI gestures into
 // commands (timeline drags become transactions). Every model change funnels through
 // onModelChanged().
+//
+// The window is laid out like the Edit page of other editors (spec phase 3.3): the timeline viewer
+// in the middle and dockable panels around it (media pool, edit index, source viewer, inspector,
+// timeline). Panels can be shown, hidden, moved and floated onto another monitor, and the layout can
+// be saved as named presets. One of the two viewers is active at a time: it receives the transport
+// keys and the In/Out marks.
 class MainWindow : public QMainWindow {
     Q_OBJECT
 
@@ -38,6 +52,23 @@ public:
     void seekToFrame(std::int64_t frame);
     void play();
 
+    // Loads pool media into the source viewer and makes it the active viewer.
+    void openInSourceViewer(const QString& mediaId);
+    bool sourceViewerActive() const { return m_sourceActive; }
+
+    // Layout presets (stored with QSettings). The last layout is saved on close; the app restores it
+    // at startup with restoreLastLayout() (tests start from the default layout).
+    bool saveLayoutPreset(const QString& name);
+    bool loadLayoutPreset(const QString& name);
+    bool deleteLayoutPreset(const QString& name);
+    QStringList layoutPresets() const;
+    void resetLayout();
+    void restoreLastLayout();
+
+    // The context menu for a right click on the timeline. The window execs it; it is built
+    // separately so tests can trigger its actions.
+    std::unique_ptr<QMenu> contextMenu(const TimelineWidget::Context& context);
+
     // Read-only access for tests and future panels.
     const ve::Project& project() const { return m_project; }
     ve::Time playheadPosition() const;
@@ -45,16 +76,27 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* event) override;
+    void showEvent(QShowEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
     void buildUi();
+    void buildDocks();
+    void applyDefaultLayout();
+    void sizeDefaultDocks();
     void buildActions();
+    void connectPanels();
     void onModelChanged();
     void updateWindowState();
     void updateTransport();
+    void refreshPanels();
+    void refreshTimelineTabs();
+    void refreshPresetsMenu();
     void tick();
+    void setActiveViewer(bool source);
 
     bool edit(const QString& name, ve::TimelineEditCommand::Operation op, const char* mergeKey = nullptr);
+    bool editProject(const QString& name, ve::ProjectEditCommand::Operation op);
     bool maybeSave();
     bool saveTo(const QString& path);
 
@@ -66,26 +108,59 @@ private:
     void exportTimeline();
     void onExportFinished(const ve::ExportResult& result, const QString& path);
 
+    // Transport of the active viewer (source or timeline).
+    void transportToggle();
+    void transportPlay();
+    void transportPause();
+    void transportStep(std::int64_t frames);
+    void transportToStart();
+    void transportToEnd();
     void togglePlay();
     void stepFrames(std::int64_t frames);
+
     void splitAtPlayhead();
     void deleteSelection();
     void rippleDeleteSelection();
     void placeMediaAt(const QString& mediaId, std::optional<ve::Time> at, const QString& trackId = {});
 
-    // Three and four point edits of the media pool's source onto the destination tracks (spec §6.1).
-    enum class SourceEdit { Insert, Overwrite, Replace, FitToFill, PlaceOnTop };
+    // Three and four point edits of the source (the source viewer, or else the pool selection) onto
+    // the destination tracks (spec §6.1).
+    enum class SourceEdit { Insert, Overwrite, Replace, FitToFill, PlaceOnTop, Append, RippleOverwrite };
     void sourceEdit(SourceEdit kind);
-    bool editProject(const QString& name, ve::ProjectEditCommand::Operation op);
     void composeSelection();
     void decomposeSelection();
+    void openCompound(const QString& clipId);
     void addTrack(ve::TrackKind kind);
-    void markIn();
+    void markIn();    // of the active viewer
     void markOut();
     void clearMarks();
-    void addMarker();
+    void clearTimelineMarks();
+    void addMarker(std::optional<ve::Time> at = std::nullopt);
     void jumpToEdit(int direction);   // previous (-1) / next (+1) cut
     void jumpToMarker(int direction); // previous / next marker
+
+    // Organization (phase 3.1) of the selection, and the timelines of the project (phase 3.2).
+    void setSelectionColor(const QString& color);
+    void setSelectionFlag(const QString& color, bool on);
+    void clearSelectionFlags();
+    void toggleSelectionEnabled();
+    void linkSelection();
+    void unlinkSelection();
+    void swapSelection(int direction);
+    void insertGapAtPlayhead();
+    void deleteGapAt(const QString& trackId, ve::Time at);
+    void deleteAllGaps();
+    void newTimeline();
+    void duplicateTimeline();
+    void renameTimeline();
+    void deleteTimeline();
+    void openTimeline(const ve::Id& timelineId);
+    void renameTrackInteractive(const QString& trackId);
+    void renameSelectionInteractive();
+    // Fills the clip colour and flag submenus for the current selection.
+    void fillLabelMenus(QMenu* colorMenu, QMenu* flagMenu, const QString& objectPrefix);
+    bool linkedSelection() const;
+    std::vector<ve::Id> selection() const;
 
     ve::Project m_project;
     ve::CommandStack m_commands{m_project};
@@ -93,8 +168,19 @@ private:
     std::unique_ptr<ve::PlaybackEngine> m_engine;
 
     ViewerWidget* m_viewer = nullptr;
+    QFrame* m_viewerPanel = nullptr;
+    QLabel* m_viewerTitle = nullptr;
     TimelineWidget* m_timeline = nullptr;
     MediaPoolWidget* m_pool = nullptr;
+    SourceViewerPanel* m_source = nullptr;
+    InspectorWidget* m_inspector = nullptr;
+    EditIndexWidget* m_index = nullptr;
+    QTabBar* m_timelineTabs = nullptr;
+    QDockWidget* m_poolDock = nullptr;
+    QDockWidget* m_indexDock = nullptr;
+    QDockWidget* m_sourceDock = nullptr;
+    QDockWidget* m_inspectorDock = nullptr;
+    QDockWidget* m_timelineDock = nullptr;
     QLabel* m_timecode = nullptr;
     QLabel* m_duration = nullptr;
     QLabel* m_status = nullptr;
@@ -109,9 +195,17 @@ private:
     QList<QAction*> m_sourceEditActions;
     QAction* m_composeAction = nullptr;
     QAction* m_decomposeAction = nullptr;
+    QAction* m_openCompoundAction = nullptr;
+    QAction* m_linkedSelectionAction = nullptr;
+    QList<QAction*> m_selectionActions; // need clips selected
+    QMenu* m_presetsMenu = nullptr;
 
     std::optional<ve::Time> m_markIn;
     std::optional<ve::Time> m_markOut;
+    bool m_sourceActive = false;
+    ve::Id m_shownTimeline;
+    std::map<ve::Id, ve::Time> m_playheads; // where each timeline was left
+    bool m_sizeDocksOnShow = true;          // default layout, until a saved one is restored
 
     QTimer m_ticker;
     QString m_projectPath;

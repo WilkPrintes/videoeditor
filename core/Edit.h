@@ -49,21 +49,46 @@ const Track* trackOfKind(const Timeline& tl, TrackKind kind, int index);
 // Without `at` the media goes after the last item of those tracks. Returns the new clip ids.
 std::vector<Id> placeMedia(Timeline& tl, const MediaItem& media, std::optional<Time> at = std::nullopt);
 
+// In the calls below, `linked` = false is the UI's linked selection switched off: the clips are
+// edited without their linked partners (which may then fall out of sync, as in other editors).
+
 // Blade at t. With an empty `only`, every clip under t on unlocked tracks is split; otherwise just
-// those clips and their linked partners.
-bool splitAt(Timeline& tl, Time t, const std::vector<Id>& only = {});
+// those clips and (when `linked`) their linked partners.
+bool splitAt(Timeline& tl, Time t, const std::vector<Id>& only = {}, bool linked = true);
 
 // Overwrite move of the clips (and their linked partners) by `delta` in time and `trackShift`
 // tracks (+1: V1 to V2 and A1 to A2). The vertical shift is reduced until every clip lands on an
 // unlocked track of its kind.
-bool moveClips(Timeline& tl, const std::vector<Id>& clipIds, Time delta, int trackShift = 0);
+bool moveClips(Timeline& tl, const std::vector<Id>& clipIds, Time delta, int trackShift = 0, bool linked = true);
 
 // Moves one edge of a clip (and, when `linked`, the same edge of its linked partners) to `newEdge`.
 // Clamped to the media handles and to neighbouring clips: this trim only consumes empty space.
 bool trimClip(Timeline& tl, const MediaPool& pool, const Id& clipId, Edge edge, Time newEdge, bool linked = true);
 
 // Lift delete (leaves a gap). Linked partners go too.
-bool deleteClips(Timeline& tl, const std::vector<Id>& clipIds);
+bool deleteClips(Timeline& tl, const std::vector<Id>& clipIds, bool linked = true);
+
+// ---------------------------------------------------------------------------------------------
+// Organization (spec §6.8, phase 3). Clips on locked tracks are left alone; each returns false when
+// nothing changed.
+// ---------------------------------------------------------------------------------------------
+
+bool renameClip(Timeline& tl, const Id& clipId, const std::string& name);
+// Colour label of the clips; an empty colour goes back to the default.
+bool setClipColor(Timeline& tl, const std::vector<Id>& clipIds, const std::string& color);
+// Adds or removes one flag colour on the clips; clearClipFlags removes them all.
+bool setClipFlag(Timeline& tl, const std::vector<Id>& clipIds, const std::string& color, bool on);
+bool clearClipFlags(Timeline& tl, const std::vector<Id>& clipIds);
+bool setClipsEnabled(Timeline& tl, const std::vector<Id>& clipIds, bool enabled);
+// Track names stay unique: a name another track already uses is refused.
+bool renameTrack(Timeline& tl, const Id& trackId, const std::string& name);
+bool setTrackColor(Timeline& tl, const Id& trackId, const std::string& color);
+bool setTrackEnabled(Timeline& tl, const Id& trackId, bool enabled);
+// Links the clips (at most one per track) into a new group: from then on they edit together, in
+// sync or not (checkSync reports a link that is out of sync). Unlink takes them out of their groups;
+// a partner left alone in its group is unlinked too.
+bool linkClips(Timeline& tl, const std::vector<Id>& clipIds);
+bool unlinkClips(Timeline& tl, const std::vector<Id>& clipIds);
 
 // ---------------------------------------------------------------------------------------------
 // Three and four point edits (spec §6.1)
@@ -115,6 +140,29 @@ std::vector<Id> fitToFillEdit(Timeline& tl, const MediaPool& pool, const EditPoi
 // range, the sound on the first unlocked audio track after every audio clip in it; tracks are added
 // when there is none. Only whether a destination is set matters here.
 std::vector<Id> placeOnTopEdit(Timeline& tl, const MediaPool& pool, const EditPoints& points);
+// Append: the source goes right after the last item of the destination tracks; the playhead and
+// the timeline In/Out are ignored.
+std::vector<Id> appendEdit(Timeline& tl, const MediaPool& pool, const EditPoints& points);
+// Ripple overwrite: the clip under the timeline start (In or playhead) on the first destination
+// track is replaced by the source and the timeline ripples by the difference in length. It is a
+// ripple delete of that clip followed by an insert, as one atomic edit with the same sync rules.
+std::vector<Id> rippleOverwriteEdit(Timeline& tl, const MediaPool& pool, const EditPoints& points);
+
+// ---------------------------------------------------------------------------------------------
+// Gaps and order (phase 3)
+// ---------------------------------------------------------------------------------------------
+
+// Opens `length` of empty time at `at` on every unlocked sync-locked track (what spans `at` is cut).
+bool insertGap(Timeline& tl, Time at, Time length);
+// Closes the gap under `at` on the track. On a sync-locked track the other unlocked sync-locked
+// tracks close the same time, so they must be empty there; otherwise the edit is refused.
+bool deleteGap(Timeline& tl, const Id& trackId, Time at);
+// Closes every stretch of time with no clip on any unlocked sync-locked track.
+bool deleteGaps(Timeline& tl);
+// Swaps the clip (and its linked partners) with the next clip to the left (direction < 0) or to
+// the right (direction > 0); what lies between them stays between them. Partners must swap with the
+// partners of that neighbour, so that picture and sound stay in sync; otherwise it is refused.
+bool swapClips(Timeline& tl, const Id& clipId, int direction);
 
 // ---------------------------------------------------------------------------------------------
 // Trims (spec §6.2). `delta` is timeline time, positive = later. Each clamps to what the media
@@ -139,7 +187,7 @@ bool slideClip(Timeline& tl, const MediaPool& pool, const Id& clipId, Time delta
 // sync-locked track loses the same time ranges, and those ranges may only hold selected clips or
 // empty space there (otherwise the delete is refused). Tracks without sync lock only close the holes
 // of their own clips.
-bool rippleDelete(Timeline& tl, const std::vector<Id>& clipIds);
+bool rippleDelete(Timeline& tl, const std::vector<Id>& clipIds, bool linked = true);
 
 // ---------------------------------------------------------------------------------------------
 // Compound clips (spec §6.3). They need the project: the nested timeline lives in it.
@@ -158,6 +206,20 @@ std::optional<Id> composeClips(Project& project, const std::vector<Id>& clipIds,
 bool decomposeClip(Project& project, const Id& compoundClipId);
 
 // ---------------------------------------------------------------------------------------------
+// Timelines of the project (phase 3)
+// ---------------------------------------------------------------------------------------------
+
+// A new empty timeline (V1 + A1, same rate and size as the current one) that becomes current.
+Id newTimeline(Project& project, std::string name = {});
+// A copy of the timeline (same clips) that becomes current.
+Id duplicateTimeline(Project& project, const Id& timelineId, std::string name = {});
+bool setCurrentTimeline(Project& project, const Id& timelineId);
+// Names stay unique; an empty or taken name is refused.
+bool renameTimeline(Project& project, const Id& timelineId, const std::string& name);
+// Refused for the last timeline and for one a compound clip shows.
+bool deleteTimeline(Project& project, const Id& timelineId);
+
+// ---------------------------------------------------------------------------------------------
 // Markers (spec §6.8)
 // ---------------------------------------------------------------------------------------------
 
@@ -165,6 +227,9 @@ bool decomposeClip(Project& project, const Id& compoundClipId);
 Id addMarker(Timeline& tl, Time at, std::string name = {}, std::string color = "blue", Time duration = Time(0));
 bool moveMarker(Timeline& tl, const Id& markerId, Time to);
 bool removeMarker(Timeline& tl, const Id& markerId);
+// Replaces the name, note, colour, start and duration of the marker with that id (start and
+// duration go to the frame grid; a start another marker uses is refused).
+bool updateMarker(Timeline& tl, const Marker& marker);
 const Marker* findMarker(const Timeline& tl, const Id& markerId);
 
 // ---------------------------------------------------------------------------------------------

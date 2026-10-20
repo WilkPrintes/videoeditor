@@ -1,8 +1,10 @@
 #include "ui/TimelineWidget.h"
 
 #include "core/Edit.h"
+#include "ui/LabelColors.h"
 #include "ui/MediaPoolWidget.h"
 
+#include <QContextMenuEvent>
 #include <QHelpEvent>
 #include <QKeyEvent>
 #include <QMimeData>
@@ -55,17 +57,7 @@ const QColor kFlagOn(214, 160, 60);
 
 QColor markerColor(const std::string& name)
 {
-    static const std::pair<const char*, QColor> named[] = {
-        {"blue", QColor(70, 130, 230)},  {"red", QColor(225, 70, 70)},     {"green", QColor(80, 190, 110)},
-        {"yellow", QColor(235, 200, 70)}, {"purple", QColor(165, 110, 220)}, {"cyan", QColor(70, 200, 210)},
-        {"pink", QColor(235, 120, 180)}, {"orange", QColor(240, 140, 60)},
-    };
-    for (const auto& [key, color] : named) {
-        if (name == key)
-            return color;
-    }
-    const QColor parsed = QColor::fromString(QString::fromStdString(name));
-    return parsed.isValid() ? parsed : named[0].second;
+    return labels::colorOf(name, QColor(70, 130, 230));
 }
 
 void drawLock(QPainter& p, const QRectF& box, bool on)
@@ -149,6 +141,7 @@ void TimelineWidget::setProject(const ve::Project* project)
     m_project = project;
     m_selected.clear();
     m_selectedMarker.clear();
+    m_focusedTrack.clear();
     m_drag = Drag::None;
     m_destVideo.clear();
     m_destAudio.clear();
@@ -183,6 +176,10 @@ void TimelineWidget::pruneSelection()
             }
         }
         markerAlive = ve::edit::findMarker(*tl, m_selectedMarker.toStdString()) != nullptr;
+        if (!m_focusedTrack.isEmpty() && !tl->track(m_focusedTrack.toStdString())) {
+            m_focusedTrack.clear();
+            emit selectionChanged();
+        }
     }
     if (!markerAlive && !m_selectedMarker.isEmpty()) {
         m_selectedMarker.clear();
@@ -532,10 +529,38 @@ TimelineWidget::Hit TimelineWidget::hitTest(const QPoint& pos) const
 
 QSet<QString> TimelineWidget::groupOf(const QString& clipId) const
 {
+    if (!m_linkedSelection)
+        return {clipId};
     QSet<QString> group;
     for (const ve::Id& id : ve::edit::linkedGroup(*timeline(), clipId.toStdString()))
         group.insert(QString::fromStdString(id));
     return group;
+}
+
+void TimelineWidget::setLinkedSelection(bool on)
+{
+    m_linkedSelection = on;
+}
+
+void TimelineWidget::selectClips(const std::vector<ve::Id>& clipIds)
+{
+    QSet<QString> selected;
+    for (const ve::Id& id : clipIds)
+        selected += groupOf(QString::fromStdString(id));
+    m_selected = selected;
+    m_selectedMarker.clear();
+    m_focusedTrack.clear();
+    emit selectionChanged();
+    update();
+}
+
+void TimelineWidget::selectMarker(const ve::Id& markerId)
+{
+    m_selected.clear();
+    m_selectedMarker = QString::fromStdString(markerId);
+    m_focusedTrack.clear();
+    emit selectionChanged();
+    update();
 }
 
 void TimelineWidget::selectGroup(const QString& clipId, bool toggle)
@@ -651,7 +676,7 @@ void TimelineWidget::beginClipGesture(const Hit& hit, Qt::KeyboardModifiers modi
     m_trimStart = hit.start;
     m_trimEnd = hit.end;
     m_trimHead = hit.kind == HitKind::Head;
-    m_trimLinked = !alt;
+    m_trimLinked = !alt && m_linkedSelection;
     m_dragSpans = {{hit.start, hit.end}};
     m_snapTargets = snapTargets(groupOf(hit.clipId));
 
@@ -672,6 +697,67 @@ void TimelineWidget::beginClipGesture(const Hit& hit, Qt::KeyboardModifiers modi
     emit gestureStarted(m_drag == Drag::Roll ? tr("Roll") : m_drag == Drag::Ripple ? tr("Ripple") : tr("Trim"));
 }
 
+void TimelineWidget::contextMenuEvent(QContextMenuEvent* event)
+{
+    if (!timeline() || m_drag != Drag::None)
+        return;
+    const QPoint pos = event->pos();
+    const Hit hit = hitTest(pos);
+    Context ctx;
+    ctx.at = timeOf(std::max<Frame>(0, frameAtX(pos.x())));
+    ctx.trackId = hit.trackId;
+    switch (hit.kind) {
+    case HitKind::Ruler:
+        ctx.kind = Context::Kind::Ruler;
+        break;
+    case HitKind::Marker:
+        ctx.kind = Context::Kind::Marker;
+        ctx.markerId = hit.markerId;
+        selectMarker(hit.markerId.toStdString());
+        break;
+    case HitKind::Header:
+    case HitKind::Flag:
+        ctx.kind = Context::Kind::TrackHeader;
+        m_focusedTrack = hit.trackId;
+        emit selectionChanged();
+        break;
+    case HitKind::Body:
+    case HitKind::Head:
+    case HitKind::Tail:
+        ctx.kind = Context::Kind::Clip;
+        ctx.clipId = hit.clipId;
+        if (!m_selected.contains(hit.clipId))
+            selectGroup(hit.clipId, false); // like other editors: the right-clicked clip becomes the selection
+        clearMarkerSelection();
+        break;
+    case HitKind::Empty: {
+        ctx.kind = Context::Kind::Empty;
+        // Inside a track, between two clips: a gap.
+        if (const ve::Track* t = timeline()->track(hit.trackId.toStdString()); t && ctx.at < t->duration())
+            ctx.kind = Context::Kind::Gap;
+        break;
+    }
+    case HitKind::None:
+        return;
+    }
+    emit contextMenuRequested(ctx, event->globalPos());
+    event->accept();
+}
+
+void TimelineWidget::mouseDoubleClickEvent(QMouseEvent* event)
+{
+    if (event->button() != Qt::LeftButton || !timeline())
+        return;
+    const Hit hit = hitTest(event->position().toPoint());
+    if (hit.kind != HitKind::Body)
+        return;
+    for (const ve::Track& t : timeline()->tracks) {
+        if (auto placed = t.findClip(hit.clipId.toStdString());
+            placed && std::holds_alternative<ve::CompoundClip>(*placed->item))
+            emit openCompoundRequested(hit.clipId);
+    }
+}
+
 void TimelineWidget::mousePressEvent(QMouseEvent* event)
 {
     if (event->button() != Qt::LeftButton || !timeline() || m_drag != Drag::None)
@@ -682,6 +768,10 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event)
     m_dragDelta = 0;
     m_trackShift = 0;
     const bool toggle = event->modifiers() & Qt::ControlModifier;
+    if (hit.kind != HitKind::Header && hit.kind != HitKind::Flag && !m_focusedTrack.isEmpty()) {
+        m_focusedTrack.clear();
+        emit selectionChanged();
+    }
 
     switch (hit.kind) {
     case HitKind::Ruler:
@@ -708,8 +798,11 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event)
     }
     case HitKind::Header: {
         const ve::Track* t = timeline()->track(hit.trackId.toStdString());
-        if (t)
+        if (t) {
             (t->kind == ve::TrackKind::Video ? m_destVideo : m_destAudio) = hit.trackId;
+            m_focusedTrack = hit.trackId; // the inspector shows the track
+            emit selectionChanged();
+        }
         break;
     }
     case HitKind::Body:
@@ -1018,6 +1111,10 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rows)
         const bool destination = id == m_destVideo || id == m_destAudio;
         if (destination)
             p.fillRect(QRect(0, r.top, 4, r.height), kAccent);
+        if (id == m_focusedTrack)
+            p.fillRect(QRect(4, r.top, kHeaderWidth - 4, r.height), QColor(255, 255, 255, 18));
+        if (!r.track->color.empty())
+            p.fillRect(QRect(kHeaderWidth - 4, r.top, 3, r.height), labels::colorOf(r.track->color, kHeader));
         p.setFont(bold);
         p.setPen(r.track->enabled ? kText : kTextDim);
         p.drawText(QRect(10, r.top, kLockX - 12, r.height), Qt::AlignVCenter | Qt::AlignLeft,
@@ -1052,6 +1149,11 @@ void TimelineWidget::paintClips(QPainter& p, const Row& row)
         QColor fill = video ? (selected ? kVideoClipSelected : kVideoClip) : (selected ? kAudioClipSelected : kAudioClip);
         if (!std::holds_alternative<ve::Clip>(*placed.item))
             fill = selected ? kCompound.lighter(130) : kCompound; // compound / multicam
+        if (!placed.clip->color.empty()) {
+            fill = labels::colorOf(placed.clip->color, fill).darker(video ? 115 : 135);
+            if (selected)
+                fill = fill.lighter(135);
+        }
         if (!placed.clip->enabled)
             fill = fill.darker(180);
         if (row.track->locked)
@@ -1065,6 +1167,15 @@ void TimelineWidget::paintClips(QPainter& p, const Row& row)
         }
         if (m_outOfSync.contains(id)) // like the red offset badges of other editors
             p.fillRect(QRectF(r.left() + 1, r.top() + 1, r.width() - 2, 3), kOutOfSync);
+        // Flags: small coloured pennants in the top right corner.
+        double fx = r.right() - 4;
+        for (auto it = placed.clip->flags.rbegin(); it != placed.clip->flags.rend() && fx > r.left() + 30; ++it) {
+            const QPointF pennant[] = {{fx - 7, r.top() + 3}, {fx, r.top() + 3}, {fx - 3.5, r.top() + 10}};
+            p.setPen(Qt::NoPen);
+            p.setBrush(labels::colorOf(*it, Qt::white));
+            p.drawPolygon(pennant, 3);
+            fx -= 9;
+        }
         if (r.width() > 28) {
             QString label = QString::fromStdString(placed.clip->name);
             if (const ve::Clip* c = std::get_if<ve::Clip>(placed.item); c && !c->retime.isIdentity() && c->retime.isValid())

@@ -182,6 +182,10 @@ inline std::vector<std::string> describe(const Timeline& tl, const MediaPool& po
             line << " (locked)";
         if (!t.syncLock)
             line << " (sync lock off)";
+        if (!t.enabled)
+            line << " (disabled)";
+        if (!t.color.empty())
+            line << " (color " << t.color << ")";
         line << ":";
         Time pos;
         bool first = true;
@@ -202,6 +206,12 @@ inline std::vector<std::string> describe(const Timeline& tl, const MediaPool& po
                     line << " x" << clip->retime.speedNum << "/" << clip->retime.speedDen;
                 if (!c->linkGroup.empty())
                     line << " link " << c->linkGroup;
+                if (!c->color.empty())
+                    line << " color " << c->color;
+                for (const std::string& flag : c->flags)
+                    line << " flag " << flag;
+                if (!c->enabled)
+                    line << " (disabled)";
             } else if (std::holds_alternative<Gap>(item)) {
                 line << "gap " << frames(d);
             } else {

@@ -37,6 +37,16 @@ public:
     Q_ENUM(TrimMode)
     Q_ENUM(TrackFlag)
 
+    // What a right click landed on; the window builds the context menu from it.
+    struct Context {
+        enum class Kind { Empty, Ruler, Marker, TrackHeader, Clip, Gap };
+        Kind kind = Kind::Empty;
+        QString clipId;
+        QString trackId;
+        QString markerId;
+        ve::Time at;
+    };
+
     explicit TimelineWidget(QWidget* parent = nullptr);
 
     void setProject(const ve::Project* project);
@@ -51,6 +61,14 @@ public:
     std::vector<ve::Id> selectedClips() const;
     ve::Id selectedMarker() const { return m_selectedMarker.toStdString(); }
     void clearMarkerSelection();
+    // Selection from elsewhere (edit index): the clips (with their partners when linked) or a marker.
+    void selectClips(const std::vector<ve::Id>& clipIds);
+    void selectMarker(const ve::Id& markerId);
+    // The track whose header was clicked last (empty after a click elsewhere): the inspector shows it.
+    ve::Id focusedTrack() const { return m_focusedTrack.toStdString(); }
+    // Linked selection (on by default): clicking a clip selects its linked partners too.
+    void setLinkedSelection(bool on);
+    bool linkedSelection() const { return m_linkedSelection; }
     // Destination tracks of three and four point edits, picked in the track headers (by default the
     // lowest video and audio tracks).
     ve::Id destinationTrack(ve::TrackKind kind) const;
@@ -77,11 +95,15 @@ signals:
     void mediaDropped(const QString& mediaId, ve::Time at, const QString& trackId);
     void filesDropped(const QStringList& paths, ve::Time at);
     void selectionChanged();
+    void contextMenuRequested(const TimelineWidget::Context& context, const QPoint& globalPos);
+    void openCompoundRequested(const QString& clipId);
 
 protected:
     bool event(QEvent* event) override;
     void paintEvent(QPaintEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
+    void contextMenuEvent(QContextMenuEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
@@ -157,6 +179,8 @@ private:
     std::optional<Frame> m_markOut;
     QSet<QString> m_selected;
     QString m_selectedMarker;
+    QString m_focusedTrack;
+    bool m_linkedSelection = true;
     QSet<QString> m_outOfSync;
     QString m_destVideo;
     QString m_destAudio;

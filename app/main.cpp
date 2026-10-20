@@ -117,6 +117,7 @@ int main(int argc, char** argv)
 
     MainWindow window;
     window.resize(1600, 960);
+    window.restoreLastLayout(); // panels and window as they were left (tests start from the default)
     window.show();
     qInfo().noquote() << "VideoEditor" << QApplication::applicationVersion() << "on Qt" << qVersion();
 

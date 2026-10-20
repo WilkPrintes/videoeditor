@@ -148,6 +148,15 @@ void writeClipBase(Value& o, const ClipBase& c)
     o.set("source_range", rangeValue(c.sourceRange));
     o.set("enabled", c.enabled);
     o.set("link_group", c.linkGroup);
+    // Phase 3 labels: written only when set, so older files and golden states stay unchanged.
+    if (!c.color.empty())
+        o.set("color", c.color);
+    if (!c.flags.empty()) {
+        Value flags = Value::array();
+        for (const std::string& f : c.flags)
+            flags.push(f);
+        o.set("flags", std::move(flags));
+    }
 }
 
 void readClipBase(const Value& o, ClipBase& c)
@@ -157,6 +166,9 @@ void readClipBase(const Value& o, ClipBase& c)
     c.sourceRange = rangeOf(o["source_range"]);
     c.enabled = o["enabled"].asBool(true);
     c.linkGroup = o["link_group"].asString();
+    c.color = o["color"].asString();
+    for (const Value& f : o["flags"].asArray())
+        c.flags.push_back(f.asString());
 }
 
 const char* alignmentName(TransitionAlignment a)
@@ -357,6 +369,8 @@ json::Value timelineToJson(const Timeline& tl)
         to.set("enabled", t.enabled);
         to.set("locked", t.locked);
         to.set("sync_lock", t.syncLock);
+        if (!t.color.empty())
+            to.set("color", t.color);
         to.set("children", std::move(children));
         tracks.push(std::move(to));
     }
@@ -401,6 +415,7 @@ Timeline timelineFromJson(const json::Value& o)
         t.enabled = to["enabled"].asBool(true);
         t.locked = to["locked"].asBool(false);
         t.syncLock = to["sync_lock"].asBool(true);
+        t.color = to["color"].asString();
         for (const Value& iv : to["children"].asArray()) {
             if (auto item = itemOf(iv))
                 t.items.push_back(std::move(*item));
