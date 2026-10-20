@@ -16,7 +16,9 @@ estão em [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Estado: fases 1 e 2 prontas, fase 3 em andamento
 
-Tudo verificado no Windows 11 (RTX 3060). O macOS ainda não foi compilado.
+Verificado no Windows 11 (RTX 3060) e, no macOS, pelo CI (macOS 15, Apple Silicon, máquina
+virtual): build, testes do core e de GUI, `ve-cli selftest` e o app empacotado. Ainda não foi
+testado num Mac físico.
 
 ### Fase 1: reproduzir e exportar (marco 1)
 
